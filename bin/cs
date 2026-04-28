@@ -12,7 +12,7 @@ COMMANDS_DIR="$HOME/.claude/commands"
 TMUX_SWITCH_DIR="$SHARED_DIR/tmux-switch"
 CS_BIN="$HOME/.local/bin/cs"
 
-RESERVED_NAMES=(add rm remove ls list current switch sw rename mv doctor help set-color shared launch pick)
+RESERVED_NAMES=(add rm remove ls list current switch sw rename mv doctor help set-color shared launch pick import)
 
 if [ -t 1 ]; then
   C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
@@ -239,8 +239,8 @@ EOF
 
   cat > "$COMMANDS_DIR/cs.md" <<EOF
 ---
-description: Управление аккаунтами Claude. Подкоманды — ls/current/add/rm/rename/set-color/doctor/help
-argument-hint: <ls|current|add|rm|rename|set-color|doctor|help> [args]
+description: Управление аккаунтами Claude. Подкоманды — ls/current/add/rm/rename/import/set-color/doctor/help
+argument-hint: <ls|current|add|rm|rename|import|set-color|doctor|help> [args]
 ---
 
 !\`$CS_BIN \$ARGUMENTS\`
@@ -466,6 +466,146 @@ cmd_doctor() {
   echo "${C_GREEN}✓${C_RESET} готово"
 }
 
+cmd_import() {
+  local source_dir="" name="" mode="copy"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      as|--as)
+        [ -z "${2:-}" ] && die "as требует имя"
+        name="$2"; shift 2 ;;
+      --move) mode="move"; shift ;;
+      --copy) mode="copy"; shift ;;
+      -h|--help)
+        cat <<'EOF'
+cs import — импортировать существующий каталог Claude Code как cs-аккаунт.
+
+использование:
+  cs import [<source-dir>] [as <name>] [--copy|--move]
+
+по умолчанию:
+  source-dir = ~/.claude
+  name       = default
+  режим      = copy (исходник остаётся; --move перемещает projects/sessions/etc в shared/)
+
+что копируется в claude-<name>/:
+  .claude.json, settings.json, plugins/, cache/, stats-cache.json,
+  mcp-needs-auth-cache.json, image-cache/, paste-cache/, backups/,
+  shell-snapshots/, debug/, telemetry/, session-env/, teams/
+
+что переносится в claude-shared/ (общее между аккаунтами):
+  projects/, sessions/, tasks/, file-history/, plans/, history.jsonl
+EOF
+        return 0 ;;
+      -*) die "неизвестный флаг: $1" ;;
+      *)
+        if [ -z "$source_dir" ]; then source_dir="$1"
+        else die "лишний аргумент: $1"
+        fi
+        shift ;;
+    esac
+  done
+
+  source_dir="${source_dir:-$HOME/.claude}"
+  name="${name:-default}"
+  validate_name "$name"
+
+  [ -d "$source_dir" ] || die "источник '$source_dir' не существует"
+  if [ ! -f "$source_dir/.claude.json" ] && [ ! -d "$source_dir/projects" ]; then
+    die "'$source_dir' не похоже на каталог Claude Code (нет .claude.json и нет projects/)"
+  fi
+
+  local target_dir; target_dir="$(account_dir "$name")"
+  [ -e "$target_dir" ] && die "аккаунт '$name' уже существует. укажи другое имя: cs import $source_dir as <other>"
+
+  log "импортирую '$source_dir' как аккаунт '$name' (режим: $mode)"
+  mkdir -p "$target_dir"
+
+  # Per-account: копируем как есть. settings.json особо — туда добавим hooks.
+  local per_account_items=(
+    .claude.json
+    plugins
+    cache
+    stats-cache.json
+    mcp-needs-auth-cache.json
+    image-cache
+    paste-cache
+    backups
+    shell-snapshots
+    debug
+    telemetry
+    session-env
+    teams
+    cs-color
+  )
+  local item
+  for item in "${per_account_items[@]}"; do
+    [ -e "$source_dir/$item" ] || continue
+    cp -R "$source_dir/$item" "$target_dir/$item" 2>/dev/null || true
+  done
+
+  # settings.json — копируем и добавим hooks через ensure_settings.
+  if [ -f "$source_dir/settings.json" ] && [ ! -L "$source_dir/settings.json" ]; then
+    cp "$source_dir/settings.json" "$target_dir/settings.json"
+  fi
+
+  # Создать симлинки на shared/.
+  ensure_shared_symlinks "$target_dir"
+
+  # Перенести/скопировать данные projects/sessions/tasks/file-history/plans в shared/.
+  local shared_items=(projects sessions tasks file-history plans)
+  for item in "${shared_items[@]}"; do
+    local src="$source_dir/$item"
+    [ -e "$src" ] || continue
+    if [ -L "$src" ]; then
+      local actual; actual="$(readlink "$src")"
+      [ "$actual" = "$SHARED_DIR/$item" ] && continue
+    fi
+    log "  $src → $SHARED_DIR/$item ($mode)"
+    if command -v rsync >/dev/null 2>&1; then
+      rsync -a --ignore-existing "$src/" "$SHARED_DIR/$item/" 2>/dev/null || true
+    else
+      cp -Rn "$src/." "$SHARED_DIR/$item/" 2>/dev/null || true
+    fi
+    if [ "$mode" = "move" ]; then
+      rm -rf "$src"
+      ln -s "$SHARED_DIR/$item" "$src"
+    fi
+  done
+
+  # history.jsonl — конкатенация (могут быть дубликаты строк, но безопасно).
+  if [ -f "$source_dir/history.jsonl" ] && [ ! -L "$source_dir/history.jsonl" ]; then
+    log "  $source_dir/history.jsonl → $SHARED_DIR/history.jsonl ($mode)"
+    if [ -s "$source_dir/history.jsonl" ]; then
+      cat "$source_dir/history.jsonl" >> "$SHARED_DIR/history.jsonl" 2>/dev/null || true
+    fi
+    if [ "$mode" = "move" ]; then
+      rm -f "$source_dir/history.jsonl"
+      ln -s "$SHARED_DIR/history.jsonl" "$source_dir/history.jsonl"
+    fi
+  fi
+
+  ensure_settings "$target_dir"
+  sync_slash_commands
+
+  echo
+  echo "${C_GREEN}✓${C_RESET} импортирован аккаунт '${C_BOLD}$name${C_RESET}'"
+  echo "  путь:    $target_dir"
+  echo "  цвет:    $(get_color "$name")"
+  echo "  режим:   $mode"
+  echo "  source:  $source_dir"
+  if [ "$mode" = "copy" ]; then
+    echo "  ${C_DIM}(оригинал не тронут — если cs не подойдёт, можно вернуться к нему)${C_RESET}"
+  else
+    echo "  ${C_DIM}(сессии перенесены в shared/, в исходнике остались симлинки)${C_RESET}"
+  fi
+  echo
+  if [ -z "${TMUX:-}" ]; then
+    echo "запустить: ${C_CYAN}cs $name${C_RESET}"
+  else
+    echo "переключиться: ${C_CYAN}cs switch $name${C_RESET}  ${C_DIM}или /$name${C_RESET}"
+  fi
+}
+
 cmd_set_color() {
   local name="${1:-}" color="${2:-}"
   { [ -z "$name" ] || [ -z "$color" ]; } && die "используй: cs set-color <name> <red|green|yellow|blue|magenta|cyan>"
@@ -493,6 +633,8 @@ ${C_BOLD}управление:${C_RESET}
   cs ls                    список аккаунтов
   cs current               текущий
   cs add <name>            создать (с --copy-from <other>)
+  cs import [<src>] [as <name>] [--copy|--move]
+                           импортировать существующий ~/.claude/ как cs-аккаунт
   cs rm <name> [-y]        удалить (архивирует в .removed-<ts>)
   cs rename <old> <new>    переименовать
   cs set-color <name> <c>  цвет окна (red/green/yellow/blue/magenta/cyan)
@@ -581,6 +723,7 @@ main() {
     rename|mv)      shift; cmd_rename "$@" ;;
     doctor)         shift; cmd_doctor "$@" ;;
     set-color)      shift; cmd_set_color "$@" ;;
+    import)         shift; cmd_import "$@" ;;
     help|-h|--help) cmd_help ;;
     *)
       local dir; dir="$(account_dir "$cmd")"

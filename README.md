@@ -35,6 +35,26 @@ curl -fsSL https://raw.githubusercontent.com/Daniil-Sakharov/CS/main/install.sh 
 - **bash 3+** — на macOS системный (3.2) подходит, GNU bash 4+ тоже работает
 - **zsh** — для tab-completion (необязательно, в bash тоже запускается, но без autocomplete)
 
+## Если у тебя уже есть Claude-история
+
+Большинство пользователей запускали Claude по умолчанию (без `CLAUDE_CONFIG_DIR`) — тогда вся история хранится в `~/.claude/`. **Установщик автоматически детектит это** и предлагает импорт. Если согласишься — старая история станет первым cs-аккаунтом и будет видна через `/resume`.
+
+Можно сделать импорт и вручную:
+
+```bash
+cs import                           # импортирует ~/.claude/ как аккаунт 'default'
+cs import ~/.claude as work         # под другим именем
+cs import ~/.claude as work --move  # переносит сессии в shared (компактнее, но необратимо)
+```
+
+**Режимы:**
+- `--copy` (по умолчанию) — копирует. Оригинал `~/.claude/` остаётся нетронутым. Безопасно для отката.
+- `--move` — переносит `projects/`, `sessions/`, `tasks/`, `file-history/`, `plans/`, `history.jsonl` в `claude-shared/`. В исходнике остаются симлинки на shared. Без дублирования.
+
+**Что копируется в новый аккаунт (per-account):** `.claude.json` (OAuth-токены), `settings.json`, `plugins/`, `cache/`, `stats-cache.json`, telemetry, etc.
+
+**Что переносится в shared (общее между аккаунтами):** `projects/`, `sessions/`, `tasks/`, `file-history/`, `plans/`, `history.jsonl`.
+
 ## Использование
 
 ### Запуск аккаунтов
@@ -68,6 +88,7 @@ cs ls                         # список аккаунтов
 cs current                    # активный
 cs add foo                    # создать (вне tmux сразу запустит cs foo для логина)
 cs add foo --copy-from work   # создать с настройками от work (без OAuth)
+cs import [src] [as name]     # импорт существующего ~/.claude/ или другого CCD
 cs rm foo                     # удалить (архивирует в .removed-<ts>)
 cs rm foo -y                  # без подтверждения
 cs rename old new             # переименовать

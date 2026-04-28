@@ -277,6 +277,92 @@ fi
 say "запускаю cs doctor"
 "$CS_BIN" doctor || true
 
+# ─── 6.5 import existing ~/.claude/ if present ────────────────────────────────
+
+DEFAULT_CCD="$HOME/.claude"
+
+# Считаем, есть ли уже хоть один cs-аккаунт.
+ALREADY_IMPORTED=0
+shopt -s nullglob
+for d in "$HOME/.local/share/claude-"*/; do
+  [ -d "$d" ] || continue
+  n="${d##*/claude-}"; n="${n%/}"
+  [ "$n" = "shared" ] && continue
+  case "$n" in *.removed-*) continue ;; esac
+  ALREADY_IMPORTED=1
+  break
+done
+shopt -u nullglob
+
+# Считаем, есть ли в ~/.claude/ сессионные данные.
+HAS_DEFAULT_DATA=0
+PROJECTS_COUNT=0
+PROJECTS_SIZE=""
+HAS_OAUTH=0
+if [ -d "$DEFAULT_CCD/projects" ] && [ ! -L "$DEFAULT_CCD/projects" ]; then
+  PROJECTS_COUNT=$(find "$DEFAULT_CCD/projects" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+  if [ "${PROJECTS_COUNT:-0}" -gt 0 ]; then
+    HAS_DEFAULT_DATA=1
+    PROJECTS_SIZE=$(du -sh "$DEFAULT_CCD/projects" 2>/dev/null | awk '{print $1}')
+  fi
+fi
+if [ -f "$DEFAULT_CCD/.claude.json" ]; then
+  if jq -e '(.oauthAccount // empty) != null' "$DEFAULT_CCD/.claude.json" >/dev/null 2>&1; then
+    HAS_OAUTH=1
+  fi
+fi
+
+if [ $HAS_DEFAULT_DATA -eq 1 ] || [ $HAS_OAUTH -eq 1 ]; then
+  echo
+  if [ $ALREADY_IMPORTED -eq 1 ]; then
+    say "найдена существующая Claude-история в ~/.claude/"
+    [ $HAS_DEFAULT_DATA -eq 1 ] && echo "    проектов: $PROJECTS_COUNT, размер: $PROJECTS_SIZE"
+    [ $HAS_OAUTH -eq 1 ] && echo "    OAuth-токены: есть"
+    echo
+    echo "    у тебя уже есть cs-аккаунты — пропускаю автоимпорт."
+    echo "    хочешь импортировать ~/.claude/ как ещё один аккаунт?"
+    echo "    cs import ~/.claude as <имя>          # копией"
+    echo "    cs import ~/.claude as <имя> --move   # с переносом сессий в shared/"
+  else
+    say "найдена существующая Claude-история в ~/.claude/"
+    [ $HAS_DEFAULT_DATA -eq 1 ] && echo "    проектов: $PROJECTS_COUNT, размер: $PROJECTS_SIZE"
+    [ $HAS_OAUTH -eq 1 ] && echo "    OAuth-токены: есть"
+    echo
+    if [ -t 0 ]; then
+      printf "импортировать как cs-аккаунт? (Y/n): "
+      read -r ans
+      case "$ans" in
+        n|N|no|NO|No)
+          warn "пропускаю импорт. позже можно сделать вручную: cs import ~/.claude as <name>"
+          ;;
+        *)
+          imp_name="default"
+          printf "имя аккаунта [default]: "
+          read -r tmp_name
+          [ -n "$tmp_name" ] && imp_name="$tmp_name"
+
+          imp_mode="copy"
+          printf "режим: copy (оригинал остаётся) или move (сессии переедут в shared)? [copy]: "
+          read -r tmp_mode
+          [ "$tmp_mode" = "move" ] && imp_mode="move"
+
+          say "импортирую..."
+          if [ "$imp_mode" = "move" ]; then
+            "$CS_BIN" import "$DEFAULT_CCD" as "$imp_name" --move || warn "import упал — попробуй вручную"
+          else
+            "$CS_BIN" import "$DEFAULT_CCD" as "$imp_name" --copy || warn "import упал — попробуй вручную"
+          fi
+          ;;
+      esac
+    else
+      warn "запуск через curl|bash — интерактивный импорт пропущен"
+      warn "запусти вручную после установки:"
+      warn "  cs import ~/.claude as default          # копия (безопасно)"
+      warn "  cs import ~/.claude as default --move   # перенос (компактно)"
+    fi
+  fi
+fi
+
 # ─── 7. summary ───────────────────────────────────────────────────────────────
 
 cat <<EOF
