@@ -1,0 +1,72 @@
+#compdef cs
+
+_cs() {
+  local -a subcmds accounts colors
+  subcmds=(
+    'add:Создать новый аккаунт'
+    'rm:Удалить аккаунт'
+    'remove:Удалить аккаунт'
+    'ls:Список аккаунтов'
+    'list:Список аккаунтов'
+    'current:Текущий аккаунт'
+    'switch:Переключить аккаунт (внутри tmux)'
+    'sw:Переключить аккаунт (внутри tmux)'
+    'rename:Переименовать аккаунт'
+    'mv:Переименовать аккаунт'
+    'doctor:Проверить/починить'
+    'set-color:Установить цвет аккаунта'
+    'help:Помощь'
+  )
+  colors=(red green yellow blue magenta cyan)
+
+  accounts=()
+  local d n
+  for d in $HOME/.local/share/claude-*/; do
+    n="${d##*/claude-}"
+    n="${n%/}"
+    [[ "$n" == "shared" ]] && continue
+    [[ "$n" == *.removed-* ]] && continue
+    accounts+=("$n")
+  done
+
+  if (( CURRENT == 2 )); then
+    _alternative \
+      "subcmds:команда:(($subcmds))" \
+      "accounts:аккаунт:($accounts)"
+    return
+  fi
+
+  case "${words[2]}" in
+    rm|remove|switch|sw|set-color)
+      if (( CURRENT == 3 )); then
+        _values "аккаунт" $accounts
+      elif (( CURRENT == 4 )) && [[ "${words[2]}" == "set-color" ]]; then
+        _values "цвет" $colors
+      fi
+      ;;
+    rename|mv)
+      if (( CURRENT == 3 )); then
+        _values "старое имя" $accounts
+      fi
+      ;;
+    add)
+      if (( CURRENT >= 4 )); then
+        case "${words[CURRENT-1]}" in
+          --copy-from) _values "источник" $accounts ;;
+          *) _values "флаг" --copy-from ;;
+        esac
+      fi
+      ;;
+    *)
+      local found=0 a
+      for a in $accounts; do
+        [[ "${words[2]}" == "$a" ]] && found=1 && break
+      done
+      if (( found )); then
+        _values "флаг claude" --resume --continue --help
+      fi
+      ;;
+  esac
+}
+
+_cs "$@"

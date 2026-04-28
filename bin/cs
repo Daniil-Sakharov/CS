@@ -1,0 +1,596 @@
+#!/usr/bin/env bash
+# cs — управление аккаунтами Claude Code.
+# https://github.com/Daniil-Sakharov/CS
+
+set -u
+
+SHARED_DIR="$HOME/.local/share/claude-shared"
+ACCOUNTS_PREFIX="$HOME/.local/share/claude-"
+TEMPLATE_SETTINGS="$SHARED_DIR/settings.template.json"
+HOOK_SCRIPT="$SHARED_DIR/hooks/session-start.sh"
+COMMANDS_DIR="$HOME/.claude/commands"
+TMUX_SWITCH_DIR="$SHARED_DIR/tmux-switch"
+CS_BIN="$HOME/.local/bin/cs"
+
+RESERVED_NAMES=(add rm remove ls list current switch sw rename mv doctor help set-color shared launch pick)
+
+if [ -t 1 ]; then
+  C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
+  C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'
+  C_BLUE=$'\033[34m'; C_MAGENTA=$'\033[35m'; C_CYAN=$'\033[36m'
+else
+  C_RESET=""; C_BOLD=""; C_DIM=""
+  C_RED=""; C_GREEN=""; C_YELLOW=""
+  C_BLUE=""; C_MAGENTA=""; C_CYAN=""
+fi
+
+default_color_for() {
+  case "$1" in
+    personal) echo cyan ;;
+    work)     echo red ;;
+    *)        echo "" ;;
+  esac
+}
+
+die() { echo "${C_RED}cs: $*${C_RESET}" >&2; exit 1; }
+log() { echo "${C_DIM}cs: $*${C_RESET}" >&2; }
+
+# Portable mtime in seconds since epoch (Linux GNU stat / BSD macOS stat)
+file_mtime() {
+  local f="$1"
+  stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo 0
+}
+
+validate_name() {
+  local name="$1"
+  [[ "$name" =~ ^[a-z][a-z0-9_-]*$ ]] || die "имя должно соответствовать ^[a-z][a-z0-9_-]*$ (получено: '$name')"
+  for r in "${RESERVED_NAMES[@]}"; do
+    [ "$name" = "$r" ] && die "имя '$name' зарезервировано"
+  done
+}
+
+account_dir() { echo "$ACCOUNTS_PREFIX$1"; }
+
+list_accounts() {
+  local dir name
+  shopt -s nullglob
+  for dir in "$ACCOUNTS_PREFIX"*/; do
+    [ -d "$dir" ] || continue
+    name="${dir#$ACCOUNTS_PREFIX}"
+    name="${name%/}"
+    [ "$name" = "shared" ] && continue
+    [[ "$name" == *.removed-* ]] && continue
+    echo "$name"
+  done
+  shopt -u nullglob
+}
+
+current_account() {
+  [ -z "${CLAUDE_CONFIG_DIR:-}" ] && return 1
+  local name="${CLAUDE_CONFIG_DIR#$ACCOUNTS_PREFIX}"
+  [ "$name" = "$CLAUDE_CONFIG_DIR" ] && return 1
+  echo "$name"
+}
+
+get_color() {
+  local name="$1" dir
+  dir="$(account_dir "$name")"
+  if [ -f "$dir/cs-color" ]; then
+    cat "$dir/cs-color"; return
+  fi
+  local d; d="$(default_color_for "$name")"
+  if [ -n "$d" ]; then
+    echo "$d"; return
+  fi
+  local hash
+  hash=$(printf '%s' "$name" | cksum | cut -d' ' -f1)
+  local colors=(red green yellow blue magenta cyan)
+  echo "${colors[$((hash % 6))]}"
+}
+
+set_color_internal() {
+  local name="$1" color="$2"
+  local valid=(red green yellow blue magenta cyan)
+  local ok=0
+  for c in "${valid[@]}"; do [ "$color" = "$c" ] && ok=1; done
+  [ $ok -eq 0 ] && die "цвет должен быть один из: ${valid[*]}"
+  local dir; dir="$(account_dir "$name")"
+  [ -d "$dir" ] || die "аккаунт '$name' не существует"
+  printf '%s' "$color" > "$dir/cs-color"
+}
+
+is_authed() {
+  local cj="$(account_dir "$1")/.claude.json"
+  [ -f "$cj" ] || return 1
+  jq -e '(.oauthAccount // empty) != null or (.customApiKeyResponses // empty) != null' "$cj" >/dev/null 2>&1
+}
+
+last_used() {
+  local f="$(account_dir "$1")/.claude.json"
+  [ -f "$f" ] || { echo "—"; return; }
+  local ts now diff
+  ts=$(file_mtime "$f")
+  now=$(date +%s)
+  diff=$((now - ts))
+  if [ $diff -lt 60 ]; then echo "только что"
+  elif [ $diff -lt 3600 ]; then echo "$((diff/60))м назад"
+  elif [ $diff -lt 86400 ]; then echo "$((diff/3600))ч назад"
+  else echo "$((diff/86400))д назад"
+  fi
+}
+
+ensure_shared_symlinks() {
+  local dir="$1"
+  local items=(projects sessions tasks file-history plans history.jsonl)
+  mkdir -p "$SHARED_DIR/projects" "$SHARED_DIR/sessions" "$SHARED_DIR/tasks" \
+           "$SHARED_DIR/file-history" "$SHARED_DIR/plans" "$TMUX_SWITCH_DIR"
+  [ -e "$SHARED_DIR/history.jsonl" ] || touch "$SHARED_DIR/history.jsonl"
+
+  local item
+  for item in "${items[@]}"; do
+    local target="$SHARED_DIR/$item"
+    local link="$dir/$item"
+    if [ -L "$link" ]; then
+      local actual; actual="$(readlink "$link")"
+      if [ "$actual" != "$target" ]; then
+        log "перепривязываю $link → $target (было: $actual)"
+        rm "$link"
+        ln -s "$target" "$link"
+      fi
+    elif [ -e "$link" ]; then
+      if [ -d "$link" ]; then
+        log "сливаю $link в $target"
+        if command -v rsync >/dev/null 2>&1; then
+          rsync -a --ignore-existing "$link/" "$target/" 2>/dev/null || true
+        else
+          (cd "$link" && find . -type f -exec sh -c 'mkdir -p "$0/$(dirname "$1")"; [ -f "$0/$1" ] || cp "$1" "$0/$1"' "$target" {} \; 2>/dev/null) || true
+        fi
+        local backup="$link.local-$(date +%s)"
+        mv "$link" "$backup"
+        ln -s "$target" "$link"
+        log "локальная копия → $backup"
+      else
+        local backup="$link.local-$(date +%s)"
+        mv "$link" "$backup"
+        ln -s "$target" "$link"
+        log "локальная копия → $backup"
+      fi
+    else
+      ln -s "$target" "$link"
+    fi
+  done
+
+  mkdir -p "$COMMANDS_DIR"
+  local clink="$dir/commands"
+  if [ -L "$clink" ]; then
+    local a; a="$(readlink "$clink")"
+    if [ "$a" != "$COMMANDS_DIR" ]; then
+      rm "$clink"
+      ln -s "$COMMANDS_DIR" "$clink"
+    fi
+  elif [ ! -e "$clink" ]; then
+    ln -s "$COMMANDS_DIR" "$clink"
+  fi
+}
+
+ensure_settings() {
+  local dir="$1"
+  local f="$dir/settings.json"
+  if [ ! -f "$f" ]; then
+    cp "$TEMPLATE_SETTINGS" "$f"
+    return
+  fi
+  if jq -e '.hooks.SessionStart' "$f" >/dev/null 2>&1; then
+    return
+  fi
+  local tmp; tmp="$(mktemp)"
+  jq --slurpfile t "$TEMPLATE_SETTINGS" '. + {hooks: $t[0].hooks}' "$f" > "$tmp" && mv "$tmp" "$f"
+  log "hooks добавлены в $f"
+}
+
+sync_slash_commands() {
+  mkdir -p "$COMMANDS_DIR"
+  local accounts=()
+  while IFS= read -r n; do accounts+=("$n"); done < <(list_accounts)
+
+  local name
+  for name in "${accounts[@]}"; do
+    cat > "$COMMANDS_DIR/$name.md" <<EOF
+---
+description: Переключиться на аккаунт '$name' (продолжает текущую беседу)
+---
+
+!\`$CS_BIN switch $name\`
+EOF
+  done
+
+  shopt -s nullglob
+  local f cmd_name keep
+  for f in "$COMMANDS_DIR"/*.md; do
+    cmd_name="$(basename "$f" .md)"
+    case "$cmd_name" in
+      account|accounts|cs) continue;;
+    esac
+    if grep -q "$CS_BIN switch" "$f" 2>/dev/null; then
+      keep=0
+      for n in "${accounts[@]}"; do
+        [ "$n" = "$cmd_name" ] && keep=1 && break
+      done
+      [ $keep -eq 0 ] && rm -f "$f"
+    fi
+  done
+  shopt -u nullglob
+
+  cat > "$COMMANDS_DIR/accounts.md" <<EOF
+---
+description: Показать все аккаунты Claude
+---
+
+!\`$CS_BIN ls\`
+EOF
+
+  cat > "$COMMANDS_DIR/account.md" <<EOF
+---
+description: Текущий аккаунт Claude
+---
+
+!\`$CS_BIN current --verbose\`
+EOF
+
+  cat > "$COMMANDS_DIR/cs.md" <<EOF
+---
+description: Управление аккаунтами Claude. Подкоманды — ls/current/add/rm/rename/set-color/doctor/help
+argument-hint: <ls|current|add|rm|rename|set-color|doctor|help> [args]
+---
+
+!\`$CS_BIN \$ARGUMENTS\`
+EOF
+}
+
+# ─── subcommands ──────────────────────────────────────────────────────────────
+
+cmd_add() {
+  local name="${1:-}"; shift || true
+  [ -z "$name" ] && die "используй: cs add <name> [--copy-from <existing>]"
+  validate_name "$name"
+  local copy_from=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --copy-from) copy_from="${2:-}"; shift 2 || die "--copy-from требует значение";;
+      *) die "неизвестный флаг: $1";;
+    esac
+  done
+
+  local dir; dir="$(account_dir "$name")"
+  [ -e "$dir" ] && die "аккаунт '$name' уже существует"
+
+  mkdir -p "$dir"
+
+  if [ -n "$copy_from" ]; then
+    local src; src="$(account_dir "$copy_from")"
+    [ -d "$src" ] || die "источник '$copy_from' не найден"
+    [ -f "$src/settings.json" ] && cp "$src/settings.json" "$dir/settings.json" || cp "$TEMPLATE_SETTINGS" "$dir/settings.json"
+    [ -f "$src/cs-color" ] && cp "$src/cs-color" "$dir/cs-color" || true
+  else
+    cp "$TEMPLATE_SETTINGS" "$dir/settings.json"
+  fi
+
+  ensure_shared_symlinks "$dir"
+  ensure_settings "$dir"
+  sync_slash_commands
+
+  echo
+  echo "${C_GREEN}✓${C_RESET} аккаунт '${C_BOLD}$name${C_RESET}' создан"
+  echo "  путь: $dir"
+  echo "  цвет: $(get_color "$name")"
+  echo
+
+  if [ -n "${TMUX:-}" ]; then
+    echo "ты сейчас внутри tmux. чтобы залогиниться, открой ${C_BOLD}новый терминал${C_RESET} и выполни:"
+    echo "  ${C_CYAN}cs $name${C_RESET}"
+  else
+    echo "запускаю ${C_CYAN}cs $name${C_RESET} для логина..."
+    sleep 1
+    exec "$CS_BIN" "$name"
+  fi
+}
+
+cmd_rm() {
+  local name="${1:-}" force=0
+  shift || true
+  [ -z "$name" ] && die "используй: cs rm <name> [-y]"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -y|--yes) force=1; shift;;
+      *) die "неизвестный флаг: $1";;
+    esac
+  done
+
+  local dir; dir="$(account_dir "$name")"
+  [ -d "$dir" ] || die "аккаунт '$name' не существует"
+
+  local cur; cur="$(current_account 2>/dev/null || true)"
+  [ "$cur" = "$name" ] && die "'$name' — текущий активный аккаунт. сначала: cs switch <other>"
+
+  if [ $force -eq 0 ]; then
+    if [ -t 0 ]; then
+      printf "удалить аккаунт '%s'? папка будет архивирована (y/N): " "$name"
+      read -r ans
+      case "$ans" in
+        y|Y|yes|YES|Yes) ;;
+        *) echo "отменено."; exit 0;;
+      esac
+    else
+      die "не TTY — для удаления добавь -y: /cs rm $name -y  (папка будет архивирована, не удалена насовсем)"
+    fi
+  fi
+
+  local archive="$dir.removed-$(date +%s)"
+  mv "$dir" "$archive"
+  rm -f "$COMMANDS_DIR/$name.md"
+  sync_slash_commands
+  echo "${C_GREEN}✓${C_RESET} аккаунт '$name' удалён"
+  echo "  архив: $archive"
+  echo "  откатить: mv '$archive' '$dir'"
+}
+
+cmd_ls() {
+  local cur; cur="$(current_account 2>/dev/null || true)"
+  printf "${C_BOLD}%2s %-15s %-50s %-6s %-15s %-8s${C_RESET}\n" "" "ИМЯ" "ПУТЬ" "AUTH" "ИСПОЛЬЗ." "ЦВЕТ"
+  local name
+  for name in $(list_accounts); do
+    local dir; dir="$(account_dir "$name")"
+    local marker=" "
+    [ "$name" = "$cur" ] && marker="${C_CYAN}*${C_RESET}"
+    local auth; is_authed "$name" && auth="${C_GREEN}✓${C_RESET}" || auth="${C_DIM}—${C_RESET}"
+    local lu; lu="$(last_used "$name")"
+    local color; color="$(get_color "$name")"
+    printf " %b %-15s %-50s %b      %-15s %-8s\n" "$marker" "$name" "$dir" "$auth" "$lu" "$color"
+  done
+}
+
+cmd_current() {
+  local verbose=0
+  [ "${1:-}" = "--verbose" ] || [ "${1:-}" = "-v" ] && verbose=1
+  local cur
+  if cur="$(current_account 2>/dev/null)"; then
+    if [ $verbose -eq 1 ]; then
+      echo "${C_BOLD}$cur${C_RESET}  (цвет: $(get_color "$cur"))"
+      echo "CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR"
+    else
+      echo "$cur"
+    fi
+  else
+    echo "(none)"
+    exit 1
+  fi
+}
+
+cmd_switch() {
+  local name="${1:-}"
+  [ -z "$name" ] && die "используй: cs switch <name>"
+  local dir; dir="$(account_dir "$name")"
+  [ -d "$dir" ] || die "аккаунт '$name' не существует. доступные: $(list_accounts | tr '\n' ' ')"
+
+  if ! command -v tmux >/dev/null 2>&1; then
+    die "cs switch требует tmux. установи tmux и попробуй снова. без tmux — cs $name --continue в новом терминале"
+  fi
+  [ -z "${TMUX:-}" ] && die "cs switch работает только внутри tmux (если просто открыть аккаунт — cs $name)"
+
+  if [ "${CLAUDE_CONFIG_DIR:-}" = "$dir" ]; then
+    echo "уже на '$name'"; exit 0
+  fi
+
+  local socket_path="${TMUX%%,*}"
+  local socket_name; socket_name="$(basename "$socket_path")"
+
+  local session_id=""
+  local state_file="$TMUX_SWITCH_DIR/$socket_name"
+  [ -f "$state_file" ] && session_id="$(cat "$state_file")"
+
+  if [ -z "$session_id" ]; then
+    local encoded; encoded="$(printf '%s' "$PWD" | sed 's|/|-|g')"
+    local projects_dir="$SHARED_DIR/projects/$encoded"
+    if [ -d "$projects_dir" ]; then
+      local newest; newest="$(ls -t "$projects_dir"/*.jsonl 2>/dev/null | head -1)"
+      [ -n "$newest" ] && session_id="$(basename "$newest" .jsonl)"
+    fi
+  fi
+
+  local color; color="$(get_color "$name")"
+  tmux -L "$socket_name" set -g pane-active-border-style "fg=$color" 2>/dev/null || true
+  tmux -L "$socket_name" set -g status-style "bg=$color,fg=black" 2>/dev/null || true
+
+  if [ -n "$session_id" ]; then
+    exec tmux -L "$socket_name" respawn-window -k \
+      "env CLAUDE_CONFIG_DIR='$dir' claude --resume '$session_id'"
+  else
+    exec tmux -L "$socket_name" respawn-window -k \
+      "env CLAUDE_CONFIG_DIR='$dir' claude"
+  fi
+}
+
+cmd_rename() {
+  local old="${1:-}" new="${2:-}"
+  { [ -z "$old" ] || [ -z "$new" ]; } && die "используй: cs rename <old> <new>"
+  validate_name "$new"
+  local odir ndir
+  odir="$(account_dir "$old")"
+  ndir="$(account_dir "$new")"
+  [ -d "$odir" ] || die "аккаунт '$old' не существует"
+  [ -e "$ndir" ] && die "аккаунт '$new' уже существует"
+  local cur; cur="$(current_account 2>/dev/null || true)"
+  [ "$cur" = "$old" ] && die "'$old' — текущий активный, переименование запрещено"
+  mv "$odir" "$ndir"
+  rm -f "$COMMANDS_DIR/$old.md"
+  sync_slash_commands
+  echo "${C_GREEN}✓${C_RESET} переименовано: $old → $new"
+}
+
+cmd_doctor() {
+  echo "${C_BOLD}cs doctor${C_RESET}"
+
+  echo
+  echo "  ${C_BOLD}зависимости${C_RESET}"
+  for tool in tmux jq; do
+    if command -v "$tool" >/dev/null 2>&1; then
+      echo "    ${C_GREEN}✓${C_RESET} $tool"
+    else
+      echo "    ${C_RED}✗${C_RESET} $tool ${C_DIM}(установи: brew install $tool / apt install $tool)${C_RESET}"
+    fi
+  done
+
+  if [ ! -f "$HOOK_SCRIPT" ]; then
+    echo "    ${C_RED}✗${C_RESET} hook-скрипт не найден: $HOOK_SCRIPT"
+  else
+    echo "    ${C_GREEN}✓${C_RESET} hook"
+  fi
+
+  if [ ! -f "$TEMPLATE_SETTINGS" ]; then
+    echo "    ${C_RED}✗${C_RESET} шаблон settings не найден: $TEMPLATE_SETTINGS"
+  else
+    echo "    ${C_GREEN}✓${C_RESET} settings template"
+  fi
+
+  local name
+  for name in $(list_accounts); do
+    local dir; dir="$(account_dir "$name")"
+    echo
+    echo "  ${C_BOLD}$name${C_RESET}  $dir"
+    ensure_shared_symlinks "$dir"
+    ensure_settings "$dir"
+    echo "    ${C_GREEN}✓${C_RESET} ok"
+  done
+  sync_slash_commands
+  echo
+  echo "${C_GREEN}✓${C_RESET} готово"
+}
+
+cmd_set_color() {
+  local name="${1:-}" color="${2:-}"
+  { [ -z "$name" ] || [ -z "$color" ]; } && die "используй: cs set-color <name> <red|green|yellow|blue|magenta|cyan>"
+  set_color_internal "$name" "$color"
+  echo "${C_GREEN}✓${C_RESET} цвет '$name' = $color"
+}
+
+cmd_help() {
+  cat <<EOF
+${C_BOLD}cs${C_RESET} — управление аккаунтами Claude Code
+${C_DIM}https://github.com/Daniil-Sakharov/CS${C_RESET}
+
+${C_BOLD}запуск:${C_RESET}
+  cs <name> [args...]      запустить Claude под аккаунтом в tmux
+  cs                       интерактивный выбор
+
+${C_BOLD}внутри tmux/Claude:${C_RESET}
+  cs switch <name>         переключить аккаунт без потери беседы
+  /<name>                  то же, как слэш-команда
+  /cs <subcommand>         любая подкоманда из Claude
+  /accounts                список аккаунтов
+  /account                 текущий аккаунт
+
+${C_BOLD}управление:${C_RESET}
+  cs ls                    список аккаунтов
+  cs current               текущий
+  cs add <name>            создать (с --copy-from <other>)
+  cs rm <name> [-y]        удалить (архивирует в .removed-<ts>)
+  cs rename <old> <new>    переименовать
+  cs set-color <name> <c>  цвет окна (red/green/yellow/blue/magenta/cyan)
+  cs doctor                проверить зависимости и состояние
+  cs help                  эта справка
+EOF
+  echo
+  echo "${C_BOLD}аккаунты:${C_RESET}"
+  for name in $(list_accounts); do
+    echo "  - $name ($(get_color "$name"))"
+  done
+}
+
+cmd_launch() {
+  local name="$1"; shift || true
+  local dir; dir="$(account_dir "$name")"
+  [ -d "$dir" ] || die "аккаунт '$name' не существует. cs add $name — чтобы создать"
+
+  if [ -n "${TMUX:-}" ]; then
+    die "уже внутри tmux. для переключения: cs switch $name. для нового tmux — открой Alacritty/iTerm и запусти cs $name там"
+  fi
+
+  if [[ "${1:-}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+    set -- --resume "$@"
+  fi
+
+  if ! command -v tmux >/dev/null 2>&1; then
+    log "tmux не установлен — запускаю claude напрямую"
+    log "переключение между аккаунтами без перезапуска (cs switch) требует tmux"
+    exec env CLAUDE_CONFIG_DIR="$dir" claude "$@"
+  fi
+
+  local sock="claude-$$"
+  local color; color="$(get_color "$name")"
+
+  local args_quoted=""
+  local a
+  for a in "$@"; do
+    args_quoted+=" $(printf '%q' "$a")"
+  done
+
+  tmux -L "$sock" new-session -d -s main -c "$PWD" \
+    "env CLAUDE_CONFIG_DIR='$dir' claude$args_quoted"
+  tmux -L "$sock" set -g pane-active-border-style "fg=$color" 2>/dev/null || true
+  tmux -L "$sock" set -g status-style "bg=$color,fg=black" 2>/dev/null || true
+  exec tmux -L "$sock" attach -t main
+}
+
+cmd_pick() {
+  local accounts=()
+  while IFS= read -r n; do accounts+=("$n"); done < <(list_accounts)
+
+  if [ ${#accounts[@]} -eq 0 ]; then
+    echo "аккаунтов нет. создать первый: ${C_CYAN}cs add <name>${C_RESET}"
+    exit 1
+  fi
+  if [ ${#accounts[@]} -eq 1 ]; then
+    cmd_launch "${accounts[0]}"
+    return
+  fi
+
+  echo "${C_BOLD}выбери аккаунт:${C_RESET}"
+  local i=1 n
+  for n in "${accounts[@]}"; do
+    printf "  %d) %s ${C_DIM}(%s)${C_RESET}\n" "$i" "$n" "$(get_color "$n")"
+    i=$((i+1))
+  done
+  printf "номер: "
+  read -r choice
+  local idx=$((choice - 1))
+  { [ $idx -lt 0 ] || [ $idx -ge ${#accounts[@]} ]; } && die "неверный номер"
+  cmd_launch "${accounts[$idx]}"
+}
+
+# ─── dispatcher ───────────────────────────────────────────────────────────────
+
+main() {
+  local cmd="${1:-}"
+  case "$cmd" in
+    "")             cmd_pick ;;
+    add)            shift; cmd_add "$@" ;;
+    rm|remove)      shift; cmd_rm "$@" ;;
+    ls|list)        shift; cmd_ls "$@" ;;
+    current)        shift; cmd_current "$@" ;;
+    switch|sw)      shift; cmd_switch "$@" ;;
+    rename|mv)      shift; cmd_rename "$@" ;;
+    doctor)         shift; cmd_doctor "$@" ;;
+    set-color)      shift; cmd_set_color "$@" ;;
+    help|-h|--help) cmd_help ;;
+    *)
+      local dir; dir="$(account_dir "$cmd")"
+      if [ -d "$dir" ]; then
+        cmd_launch "$@"
+      else
+        die "неизвестная команда или аккаунт: '$cmd'. cs help — справка"
+      fi
+      ;;
+  esac
+}
+
+main "$@"
