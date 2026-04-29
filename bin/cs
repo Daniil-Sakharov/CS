@@ -149,6 +149,16 @@ ensure_shared_symlinks() {
         mv "$link" "$backup"
         ln -s "$target" "$link"
         log "локальная копия → $backup"
+      elif [ -f "$link" ]; then
+        # Обычный файл (history.jsonl) — конкатенируем в shared, потом бэкап.
+        if [ -s "$link" ]; then
+          log "сливаю $link → $target (concat)"
+          cat "$link" >> "$target" 2>/dev/null || true
+        fi
+        local backup="$link.local-$(date +%s)"
+        mv "$link" "$backup"
+        ln -s "$target" "$link"
+        log "локальная копия → $backup"
       else
         local backup="$link.local-$(date +%s)"
         mv "$link" "$backup"
