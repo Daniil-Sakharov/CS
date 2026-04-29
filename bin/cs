@@ -562,6 +562,11 @@ EOF
   ensure_shared_symlinks "$target_dir"
 
   # Перенести/скопировать данные projects/sessions/tasks/file-history/plans в shared/.
+  # В режиме --move оригинал не удаляется через rm -rf (это могло бы потерять
+  # файлы, которые rsync --ignore-existing пропустил из-за конфликта имён).
+  # Вместо этого: переименовываем оригинал в .imported-<ts>, ставим симлинк.
+  # Юзер сам удалит backup когда убедится что всё в порядке.
+  local ts="$(date +%s)"
   local shared_items=(projects sessions tasks file-history plans)
   for item in "${shared_items[@]}"; do
     local src="$source_dir/$item"
@@ -577,8 +582,10 @@ EOF
       cp -Rn "$src/." "$SHARED_DIR/$item/" 2>/dev/null || true
     fi
     if [ "$mode" = "move" ]; then
-      rm -rf "$src"
+      local backup="$src.imported-$ts"
+      mv "$src" "$backup"
       ln -s "$SHARED_DIR/$item" "$src"
+      log "    оригинал: $backup (удали вручную когда убедишься: rm -rf $backup)"
     fi
   done
 
@@ -589,7 +596,8 @@ EOF
       cat "$source_dir/history.jsonl" >> "$SHARED_DIR/history.jsonl" 2>/dev/null || true
     fi
     if [ "$mode" = "move" ]; then
-      rm -f "$source_dir/history.jsonl"
+      local backup="$source_dir/history.jsonl.imported-$ts"
+      mv "$source_dir/history.jsonl" "$backup"
       ln -s "$SHARED_DIR/history.jsonl" "$source_dir/history.jsonl"
     fi
   fi
