@@ -415,44 +415,19 @@ cmd_switch() {
     return 1
   }
 
-  if [ -z "$session_id" ]; then
-    # Build set of session_ids currently CLAIMED by other LIVE tmux panes.
-    # State files persist across pane lifecycle — must verify tmux socket is alive
-    # otherwise stale claims block legitimate resume.
-    local claimed_ids="" _f _sid _sock_name _sock_path
-    # tmux socket dirs (macOS uses /private/tmp/tmux-UID/, linux /tmp/tmux-UID/)
-    local _tmux_dirs="/private/tmp/tmux-$(id -u) /tmp/tmux-$(id -u)"
-    for _f in "$TMUX_SWITCH_DIR"/*."$name"; do
-      [ -f "$_f" ] || continue
-      _sock_name="$(basename "$_f" ".$name")"
-      # Check if tmux socket alive
-      local _alive=0
-      for _d in $_tmux_dirs; do
-        if [ -S "$_d/$_sock_name" ]; then _alive=1; break; fi
-      done
-      [ "$_alive" -eq 0 ] && continue
-      _sid="$(tr -d '\n' < "$_f")"
-      [ -n "$_sid" ] && claimed_ids="$claimed_ids$_sid
-"
-    done
+  # NO registry fallback — was source of "random session" surprises.
+  # If this pane has no record for this account → open FRESH claude.
+  # User who wants specific past session: claude --resume <id> manually.
 
-    local registry="$SHARED_DIR/account-sessions/$name.tsv"
-    if [ -f "$registry" ]; then
-      # Same PWD first, then any PWD; skip claimed; validate jsonl exists.
-      local candidates
-      candidates="$(awk -F'\t' -v pwd="$PWD" '$3 == pwd {print $1"\t"$2}' "$registry" | sort -rn | cut -f2)"
-      candidates="$candidates"$'\n'"$(awk -F'\t' '{print $1"\t"$2}' "$registry" | sort -rn | cut -f2)"
-      while IFS= read -r cand; do
-        [ -z "$cand" ] && continue
-        # Skip if claimed by other pane
-        if echo "$claimed_ids" | grep -qE "^${cand}$"; then
-          continue
-        fi
-        if _cs_validate_session "$cand"; then
-          session_id="$cand"
-          break
-        fi
-      done <<< "$candidates"
+  # Validate per-pane session_id (exists + non-empty jsonl) — if stale, open fresh
+  if [ -n "$session_id" ]; then
+    local _enc; _enc="$(printf '%s' "$PWD" | sed 's|/|-|g')"
+    local _jsonl="$SHARED_DIR/projects/$_enc/$session_id.jsonl"
+    if [ ! -s "$_jsonl" ]; then
+      _jsonl="$(find "$SHARED_DIR/projects" -name "$session_id.jsonl" -type f -size +0 2>/dev/null | head -1)"
+      if [ -z "$_jsonl" ]; then
+        session_id=""  # stale — fall through to fresh
+      fi
     fi
   fi
 
