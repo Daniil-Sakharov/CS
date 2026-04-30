@@ -394,55 +394,43 @@ cmd_switch() {
   local socket_path="${TMUX%%,*}"
   local socket_name; socket_name="$(basename "$socket_path")"
 
+  # pane_id — уникальный внутри tmux-сервера
+  local pane_id="${TMUX_PANE:-}"
+  [ -z "$pane_id" ] && pane_id="$(tmux display -p '#{pane_id}' 2>/dev/null || true)"
+  pane_id="${pane_id#%}"
+  [ -z "$pane_id" ] && die "не удалось определить tmux pane_id"
+
+  # PWD-хеш — чтобы переключения между аккаунтами не путались между разными
+  # директориями: ключ = (socket, pane, cwd, account).
+  local pwd_hash; pwd_hash="$(printf '%s' "$PWD" | cksum | cut -d' ' -f1)"
+
   local session_id=""
-  # Per-account state file (cs switch X / cs switch Y in same pane track separate)
-  local state_file="$TMUX_SWITCH_DIR/$socket_name.$name"
-  [ -f "$state_file" ] && session_id="$(cat "$state_file")"
+  local state_file="$TMUX_SWITCH_DIR/$socket_name.p$pane_id.$pwd_hash.$name"
+  [ -f "$state_file" ] && session_id="$(cat "$state_file" | tr -d '[:space:]')"
 
-  # Account-aware fallback: read per-account registry, VALIDATE session jsonl still exists
-  # before --resume (avoid `claude --resume <stale-id>` failure that opens nothing useful).
-  # Priority: same PWD newest valid > any PWD newest valid > fresh
-  _cs_validate_session() {
-    # $1 = session_id; returns 0 if jsonl exists & non-empty, 1 otherwise
-    local sid="$1" enc f
-    [ -z "$sid" ] && return 1
-    enc="$(printf '%s' "$PWD" | sed 's|/|-|g')"
-    f="$SHARED_DIR/projects/$enc/$sid.jsonl"
-    [ -s "$f" ] && return 0
-    # Search any PWD for this session (in case we changed cwd)
-    f="$(find "$SHARED_DIR/projects" -name "$sid.jsonl" -type f -size +0 2>/dev/null | head -1)"
-    [ -n "$f" ] && return 0
-    return 1
-  }
-
-  # Validate per-pane session_id (exists + non-empty jsonl) — if stale, fall back
+  # Жёсткая валидация: jsonl должен лежать ровно в projects/<encoded-pwd>/.
+  # Никаких find-фолбэков по другим проектам — иначе резюм уезжает в чужой
+  # контекст ("переключило не туда"). Если jsonl нет → fresh + чистим state.
   if [ -n "$session_id" ]; then
     local _enc; _enc="$(printf '%s' "$PWD" | sed 's|/|-|g')"
-    local _jsonl="$SHARED_DIR/projects/$_enc/$session_id.jsonl"
-    if [ ! -s "$_jsonl" ]; then
-      _jsonl="$(find "$SHARED_DIR/projects" -name "$session_id.jsonl" -type f -size +0 2>/dev/null | head -1)"
-      if [ -z "$_jsonl" ]; then
-        session_id=""
-      fi
+    if [ ! -s "$SHARED_DIR/projects/$_enc/$session_id.jsonl" ]; then
+      log "session $session_id для этого PWD недоступна — открываю fresh"
+      rm -f "$state_file"
+      session_id=""
     fi
   fi
-
-  # NO registry fallback — sticky session per-pane is the design.
-  # If this pane (claude-<socket>) never had account X session before → open fresh.
-  # When user works → SessionStart hook writes claude-<socket>.<account> = session_id
-  # Next /switch <account> in same pane → reads state file → resume same session.
-  # This is THE mechanism for "switch accounts but keep my place" workflow.
-
 
   local color; color="$(get_color "$name")"
   tmux -L "$socket_name" set -g pane-active-border-style "fg=$color" 2>/dev/null || true
   tmux -L "$socket_name" set -g status-style "bg=$color,fg=black" 2>/dev/null || true
 
+  # respawn-pane вместо respawn-window: переключение не убивает соседние пэйны
+  # в том же окне (vim/tests/etc). При single-pane поведение идентично.
   if [ -n "$session_id" ]; then
-    exec tmux -L "$socket_name" respawn-window -k \
+    exec tmux -L "$socket_name" respawn-pane -k -c "$PWD" \
       "env CLAUDE_CONFIG_DIR='$dir' claude --resume '$session_id'"
   else
-    exec tmux -L "$socket_name" respawn-window -k \
+    exec tmux -L "$socket_name" respawn-pane -k -c "$PWD" \
       "env CLAUDE_CONFIG_DIR='$dir' claude"
   fi
 }
@@ -761,67 +749,81 @@ cmd_doctor_v2() {
   echo "═══ cs health check (v2) ═══"
   echo ""
 
-  # 1) Account dirs
   echo "▸ Accounts:"
+  local d n
   for d in "${ACCOUNTS_PREFIX}"*; do
     [ -d "$d" ] || continue
-    local n; n="$(basename "$d" | sed 's/^claude-//')"
+    n="$(basename "$d" | sed 's/^claude-//')"
     [ "$n" = "shared" ] && continue
+    case "$n" in *.removed-*) continue ;; esac
     echo "  • $n → $d"
   done
 
-  # 2) tmux-switch state files
-  echo ""
-  echo "▸ tmux-switch state files: $(ls "$TMUX_SWITCH_DIR" 2>/dev/null | wc -l | tr -d ' ')"
-
-  # 3) Per-account registry
-  echo ""
-  echo "▸ Account session registries:"
-  for f in "$SHARED_DIR/account-sessions"/*.tsv; do
+  local total=0 valid=0 stale_jsonl=0 dead_socket=0 empty=0
+  shopt -s nullglob
+  local f fname socket pid sid
+  for f in "$TMUX_SWITCH_DIR"/*; do
     [ -f "$f" ] || continue
-    echo "  • $(basename "$f" .tsv): $(wc -l < "$f" | tr -d ' ') sessions"
+    total=$((total+1))
+    fname="$(basename "$f")"
+    socket="${fname%%.*}"
+    pid="${socket#claude-}"
+    if ! kill -0 "$pid" 2>/dev/null; then
+      dead_socket=$((dead_socket+1))
+      continue
+    fi
+    sid="$(cat "$f" 2>/dev/null | tr -d '[:space:]')"
+    if [ -z "$sid" ]; then
+      empty=$((empty+1))
+      continue
+    fi
+    if find "$SHARED_DIR/projects" -name "$sid.jsonl" -type f -size +0 2>/dev/null | head -1 | grep -q .; then
+      valid=$((valid+1))
+    else
+      stale_jsonl=$((stale_jsonl+1))
+    fi
   done
-
-  # 4) Stale jsonl check (registry entries pointing to deleted files)
-  echo ""
-  echo "▸ Validating registry entries..."
-  local stale=0 valid=0
-  for f in "$SHARED_DIR/account-sessions"/*.tsv; do
-    [ -f "$f" ] || continue
-    while IFS=$'\t' read -r ts sid cwd; do
-      [ -z "$sid" ] && continue
-      local enc; enc="$(printf '%s' "$cwd" | sed 's|/|-|g')"
-      if [ -s "$SHARED_DIR/projects/$enc/$sid.jsonl" ] || find "$SHARED_DIR/projects" -name "$sid.jsonl" -type f -size +0 2>/dev/null | head -1 | grep -q .; then
-        valid=$((valid+1))
-      else
-        stale=$((stale+1))
-      fi
-    done < "$f"
-  done
-  echo "  Valid: $valid"
-  echo "  Stale (jsonl missing): $stale"
+  shopt -u nullglob
 
   echo ""
-  echo "▸ Health: $([ "$stale" -eq 0 ] && echo OK || echo "$stale stale entries — run 'cs doctor-v2 --prune' to clean")"
+  echo "▸ tmux-switch state files: $total"
+  echo "  Valid:                 $valid"
+  echo "  Dead socket (pid gone): $dead_socket"
+  echo "  Empty:                 $empty"
+  echo "  Stale jsonl missing:   $stale_jsonl"
+
+  echo ""
+  if [ $((dead_socket + empty + stale_jsonl)) -eq 0 ]; then
+    echo "▸ Health: ${C_GREEN}OK${C_RESET}"
+  else
+    echo "▸ Health: $((dead_socket + empty + stale_jsonl)) stale — ${C_CYAN}cs doctor-v2 --prune${C_RESET} чтобы вычистить"
+  fi
 }
 
 cmd_doctor_v2_prune() {
-  for f in "$SHARED_DIR/account-sessions"/*.tsv; do
+  local removed=0 kept=0
+  shopt -s nullglob
+  local f fname socket pid sid
+  for f in "$TMUX_SWITCH_DIR"/*; do
     [ -f "$f" ] || continue
-    local kept=0 removed=0
-    local tmp; tmp="$(mktemp)"
-    while IFS=$'\t' read -r ts sid cwd; do
-      [ -z "$sid" ] && continue
-      if find "$SHARED_DIR/projects" -name "$sid.jsonl" -type f -size +0 2>/dev/null | head -1 | grep -q .; then
-        printf '%s\t%s\t%s\n' "$ts" "$sid" "$cwd" >> "$tmp"
-        kept=$((kept+1))
-      else
-        removed=$((removed+1))
-      fi
-    done < "$f"
-    mv "$tmp" "$f"
-    echo "  $(basename "$f"): kept=$kept removed=$removed"
+    fname="$(basename "$f")"
+    socket="${fname%%.*}"
+    pid="${socket#claude-}"
+    if ! kill -0 "$pid" 2>/dev/null; then
+      rm -f "$f"; removed=$((removed+1)); continue
+    fi
+    sid="$(cat "$f" 2>/dev/null | tr -d '[:space:]')"
+    if [ -z "$sid" ]; then
+      rm -f "$f"; removed=$((removed+1)); continue
+    fi
+    if find "$SHARED_DIR/projects" -name "$sid.jsonl" -type f -size +0 2>/dev/null | head -1 | grep -q .; then
+      kept=$((kept+1))
+    else
+      rm -f "$f"; removed=$((removed+1))
+    fi
   done
+  shopt -u nullglob
+  echo "  kept=$kept  removed=$removed"
 }
 
 
