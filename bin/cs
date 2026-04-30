@@ -415,21 +415,23 @@ cmd_switch() {
     return 1
   }
 
-  # NO registry fallback — was source of "random session" surprises.
-  # If this pane has no record for this account → open FRESH claude.
-  # User who wants specific past session: claude --resume <id> manually.
-
-  # Validate per-pane session_id (exists + non-empty jsonl) — if stale, open fresh
+  # Validate per-pane session_id (exists + non-empty jsonl) — if stale, fall back
   if [ -n "$session_id" ]; then
     local _enc; _enc="$(printf '%s' "$PWD" | sed 's|/|-|g')"
     local _jsonl="$SHARED_DIR/projects/$_enc/$session_id.jsonl"
     if [ ! -s "$_jsonl" ]; then
       _jsonl="$(find "$SHARED_DIR/projects" -name "$session_id.jsonl" -type f -size +0 2>/dev/null | head -1)"
       if [ -z "$_jsonl" ]; then
-        session_id=""  # stale — fall through to fresh
+        session_id=""
       fi
     fi
   fi
+
+  # NO registry fallback — sticky session per-pane is the design.
+  # If this pane (claude-<socket>) never had account X session before → open fresh.
+  # When user works → SessionStart hook writes claude-<socket>.<account> = session_id
+  # Next /switch <account> in same pane → reads state file → resume same session.
+  # This is THE mechanism for "switch accounts but keep my place" workflow.
 
 
   local color; color="$(get_color "$name")"
