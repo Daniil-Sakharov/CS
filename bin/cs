@@ -408,6 +408,25 @@ cmd_switch() {
   local state_file="$TMUX_SWITCH_DIR/$socket_name.p$pane_id.$pwd_hash.$name"
   [ -f "$state_file" ] && session_id="$(cat "$state_file" | tr -d '[:space:]')"
 
+  # Legacy-фолбэк: для пэйнов, открытых ДО апгрейда, нового-формата state нет
+  # (хук в существующей сессии не фаерится). Берём legacy <socket>.<account> и
+  # промоутим в новый ключ, ЕСЛИ jsonl этой сессии лежит в projects/<pwd>/.
+  # Валидация по PWD страхует от резюма в чужой проект.
+  if [ -z "$session_id" ]; then
+    local _legacy="$TMUX_SWITCH_DIR/$socket_name.$name"
+    if [ -f "$_legacy" ]; then
+      local _legacy_sid; _legacy_sid="$(cat "$_legacy" | tr -d '[:space:]')"
+      if [ -n "$_legacy_sid" ]; then
+        local _enc_l; _enc_l="$(printf '%s' "$PWD" | sed 's|/|-|g')"
+        if [ -s "$SHARED_DIR/projects/$_enc_l/$_legacy_sid.jsonl" ]; then
+          session_id="$_legacy_sid"
+          printf '%s' "$session_id" > "$state_file"
+          log "promote legacy state → $state_file"
+        fi
+      fi
+    fi
+  fi
+
   # Жёсткая валидация: jsonl должен лежать ровно в projects/<encoded-pwd>/.
   # Никаких find-фолбэков по другим проектам — иначе резюм уезжает в чужой
   # контекст ("переключило не туда"). Если jsonl нет → fresh + чистим state.
