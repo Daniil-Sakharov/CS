@@ -395,17 +395,44 @@ cmd_switch() {
   local socket_name; socket_name="$(basename "$socket_path")"
 
   local session_id=""
-  local state_file="$TMUX_SWITCH_DIR/$socket_name"
+  # Per-account state file (cs switch X / cs switch Y in same pane track separate)
+  local state_file="$TMUX_SWITCH_DIR/$socket_name.$name"
   [ -f "$state_file" ] && session_id="$(cat "$state_file")"
 
+  # Account-aware fallback: read per-account registry, VALIDATE session jsonl still exists
+  # before --resume (avoid `claude --resume <stale-id>` failure that opens nothing useful).
+  # Priority: same PWD newest valid > any PWD newest valid > fresh
+  _cs_validate_session() {
+    # $1 = session_id; returns 0 if jsonl exists & non-empty, 1 otherwise
+    local sid="$1" enc f
+    [ -z "$sid" ] && return 1
+    enc="$(printf '%s' "$PWD" | sed 's|/|-|g')"
+    f="$SHARED_DIR/projects/$enc/$sid.jsonl"
+    [ -s "$f" ] && return 0
+    # Search any PWD for this session (in case we changed cwd)
+    f="$(find "$SHARED_DIR/projects" -name "$sid.jsonl" -type f -size +0 2>/dev/null | head -1)"
+    [ -n "$f" ] && return 0
+    return 1
+  }
+
   if [ -z "$session_id" ]; then
-    local encoded; encoded="$(printf '%s' "$PWD" | sed 's|/|-|g')"
-    local projects_dir="$SHARED_DIR/projects/$encoded"
-    if [ -d "$projects_dir" ]; then
-      local newest; newest="$(ls -t "$projects_dir"/*.jsonl 2>/dev/null | head -1)"
-      [ -n "$newest" ] && session_id="$(basename "$newest" .jsonl)"
+    local registry="$SHARED_DIR/account-sessions/$name.tsv"
+    if [ -f "$registry" ]; then
+      # Iterate candidates from newest to oldest, pick first valid one
+      local candidates
+      # Same PWD first, then any PWD
+      candidates="$(awk -F'\t' -v pwd="$PWD" '$3 == pwd {print $1"\t"$2}' "$registry" | sort -rn | cut -f2)"
+      candidates="$candidates"$'\n'"$(awk -F'\t' '{print $1"\t"$2}' "$registry" | sort -rn | cut -f2)"
+      while IFS= read -r cand; do
+        [ -z "$cand" ] && continue
+        if _cs_validate_session "$cand"; then
+          session_id="$cand"
+          break
+        fi
+      done <<< "$candidates"
     fi
   fi
+
 
   local color; color="$(get_color "$name")"
   tmux -L "$socket_name" set -g pane-active-border-style "fg=$color" 2>/dev/null || true
@@ -729,9 +756,86 @@ cmd_pick() {
 
 # ─── dispatcher ───────────────────────────────────────────────────────────────
 
+
+cmd_doctor_v2() {
+  echo "═══ cs health check (v2) ═══"
+  echo ""
+
+  # 1) Account dirs
+  echo "▸ Accounts:"
+  for d in "${ACCOUNTS_PREFIX}"*; do
+    [ -d "$d" ] || continue
+    local n; n="$(basename "$d" | sed 's/^claude-//')"
+    [ "$n" = "shared" ] && continue
+    echo "  • $n → $d"
+  done
+
+  # 2) tmux-switch state files
+  echo ""
+  echo "▸ tmux-switch state files: $(ls "$TMUX_SWITCH_DIR" 2>/dev/null | wc -l | tr -d ' ')"
+
+  # 3) Per-account registry
+  echo ""
+  echo "▸ Account session registries:"
+  for f in "$SHARED_DIR/account-sessions"/*.tsv; do
+    [ -f "$f" ] || continue
+    echo "  • $(basename "$f" .tsv): $(wc -l < "$f" | tr -d ' ') sessions"
+  done
+
+  # 4) Stale jsonl check (registry entries pointing to deleted files)
+  echo ""
+  echo "▸ Validating registry entries..."
+  local stale=0 valid=0
+  for f in "$SHARED_DIR/account-sessions"/*.tsv; do
+    [ -f "$f" ] || continue
+    while IFS=$'\t' read -r ts sid cwd; do
+      [ -z "$sid" ] && continue
+      local enc; enc="$(printf '%s' "$cwd" | sed 's|/|-|g')"
+      if [ -s "$SHARED_DIR/projects/$enc/$sid.jsonl" ] || find "$SHARED_DIR/projects" -name "$sid.jsonl" -type f -size +0 2>/dev/null | head -1 | grep -q .; then
+        valid=$((valid+1))
+      else
+        stale=$((stale+1))
+      fi
+    done < "$f"
+  done
+  echo "  Valid: $valid"
+  echo "  Stale (jsonl missing): $stale"
+
+  echo ""
+  echo "▸ Health: $([ "$stale" -eq 0 ] && echo OK || echo "$stale stale entries — run 'cs doctor-v2 --prune' to clean")"
+}
+
+cmd_doctor_v2_prune() {
+  for f in "$SHARED_DIR/account-sessions"/*.tsv; do
+    [ -f "$f" ] || continue
+    local kept=0 removed=0
+    local tmp; tmp="$(mktemp)"
+    while IFS=$'\t' read -r ts sid cwd; do
+      [ -z "$sid" ] && continue
+      if find "$SHARED_DIR/projects" -name "$sid.jsonl" -type f -size +0 2>/dev/null | head -1 | grep -q .; then
+        printf '%s\t%s\t%s\n' "$ts" "$sid" "$cwd" >> "$tmp"
+        kept=$((kept+1))
+      else
+        removed=$((removed+1))
+      fi
+    done < "$f"
+    mv "$tmp" "$f"
+    echo "  $(basename "$f"): kept=$kept removed=$removed"
+  done
+}
+
+
 main() {
   local cmd="${1:-}"
   case "$cmd" in
+    doctor-v2|health)
+      shift
+      if [ "${1:-}" = "--prune" ]; then
+        cmd_doctor_v2_prune
+      else
+        cmd_doctor_v2
+      fi
+      ;;
     "")             cmd_pick ;;
     add)            shift; cmd_add "$@" ;;
     rm|remove)      shift; cmd_rm "$@" ;;
