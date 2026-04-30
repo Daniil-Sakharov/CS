@@ -418,8 +418,14 @@ cmd_switch() {
   if [ -z "$session_id" ]; then
     # Build set of session_ids currently CLAIMED by other tmux panes (their active state files).
     # Prevents stealing a live session from another pane.
-    local claimed_ids
-    claimed_ids="$(cat "$TMUX_SWITCH_DIR"/*."$name" 2>/dev/null | sort -u)"
+    # Read each file separately (state files may not end with newline → cat would concat).
+    local claimed_ids="" _f _sid
+    for _f in "$TMUX_SWITCH_DIR"/*."$name"; do
+      [ -f "$_f" ] || continue
+      _sid="$(tr -d '\n' < "$_f")"
+      [ -n "$_sid" ] && claimed_ids="$claimed_ids$_sid
+"
+    done
 
     local registry="$SHARED_DIR/account-sessions/$name.tsv"
     if [ -f "$registry" ]; then
