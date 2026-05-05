@@ -12,7 +12,7 @@ COMMANDS_DIR="$HOME/.claude/commands"
 TMUX_SWITCH_DIR="$SHARED_DIR/tmux-switch"
 CS_BIN="$HOME/.local/bin/cs"
 
-RESERVED_NAMES=(add rm remove ls list current switch sw rename mv doctor help set-color shared launch pick import)
+RESERVED_NAMES=(add rm remove ls list current switch sw rename mv doctor help set-color shared launch pick import usage limits)
 
 if [ -t 1 ]; then
   C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
@@ -188,14 +188,27 @@ ensure_settings() {
   local f="$dir/settings.json"
   if [ ! -f "$f" ]; then
     cp "$TEMPLATE_SETTINGS" "$f"
-    return
   fi
-  if jq -e '.hooks.SessionStart' "$f" >/dev/null 2>&1; then
-    return
+
+  # 1) Hooks (SessionStart) — нужен для записи session_id в state-файл.
+  if ! jq -e '.hooks.SessionStart' "$f" >/dev/null 2>&1; then
+    local tmp; tmp="$(mktemp)"
+    jq --slurpfile t "$TEMPLATE_SETTINGS" '. + {hooks: $t[0].hooks}' "$f" > "$tmp" && mv "$tmp" "$f"
+    log "hooks добавлены в $f"
   fi
-  local tmp; tmp="$(mktemp)"
-  jq --slurpfile t "$TEMPLATE_SETTINGS" '. + {hooks: $t[0].hooks}' "$f" > "$tmp" && mv "$tmp" "$f"
-  log "hooks добавлены в $f"
+
+  # 2) Permissions.allow для cs binary — чтобы /cs ... в claude не дёргал
+  #    permission-check на каждый вызов cs. Добавляем оба варианта (без и с
+  #    аргументами) для совместимости разных версий claude.
+  local p1="Bash($CS_BIN)" p2="Bash($CS_BIN *)"
+  if ! jq -e --arg p "$p1" '(.permissions.allow // []) | index($p)' "$f" >/dev/null 2>&1 \
+     || ! jq -e --arg p "$p2" '(.permissions.allow // []) | index($p)' "$f" >/dev/null 2>&1; then
+    local tmp; tmp="$(mktemp)"
+    jq --arg p1 "$p1" --arg p2 "$p2" \
+       '.permissions.allow = ((.permissions.allow // []) + [$p1, $p2] | unique)' \
+       "$f" > "$tmp" && mv "$tmp" "$f"
+    log "cs-permission добавлен в $f"
+  fi
 }
 
 sync_slash_commands() {
@@ -249,12 +262,17 @@ EOF
 
   cat > "$COMMANDS_DIR/cs.md" <<EOF
 ---
-description: Управление аккаунтами Claude. Подкоманды — ls/current/add/rm/rename/import/set-color/doctor/help
-argument-hint: <ls|current|add|rm|rename|import|set-color|doctor|help> [args]
+description: Управление аккаунтами Claude. Подкоманды — ls/current/add/rm/rename/import/set-color/doctor/usage/help
+argument-hint: <ls|current|add|rm|rename|import|set-color|doctor|usage|help> [args]
 ---
 
 !\`$CS_BIN \$ARGUMENTS\`
 EOF
+
+  # /usage не создаём отдельной слешкомандой — это нативная команда claude
+  # для текущей сессии, не хотим её затирать. Лимиты по аккаунтам — через
+  # /cs usage [args] (или из терминала: cs usage).
+  rm -f "$COMMANDS_DIR/usage.md"
 }
 
 # ─── subcommands ──────────────────────────────────────────────────────────────
@@ -378,7 +396,9 @@ cmd_current() {
 
 cmd_switch() {
   local name="${1:-}"
-  [ -z "$name" ] && die "используй: cs switch <name>"
+  local explicit_sid="${2:-}"   # NEW: если передан — резюмим именно эту сессию,
+                                 #  а cwd берём из её jsonl (поддерживает worktree)
+  [ -z "$name" ] && die "используй: cs switch <name> [<session_id>]"
   local dir; dir="$(account_dir "$name")"
   [ -d "$dir" ] || die "аккаунт '$name' не существует. доступные: $(list_accounts | tr '\n' ' ')"
 
@@ -387,70 +407,122 @@ cmd_switch() {
   fi
   [ -z "${TMUX:-}" ] && die "cs switch работает только внутри tmux (если просто открыть аккаунт — cs $name)"
 
-  if [ "${CLAUDE_CONFIG_DIR:-}" = "$dir" ]; then
+  if [ "${CLAUDE_CONFIG_DIR:-}" = "$dir" ] && [ -z "$explicit_sid" ]; then
     echo "уже на '$name'"; exit 0
   fi
 
   local socket_path="${TMUX%%,*}"
   local socket_name; socket_name="$(basename "$socket_path")"
 
-  # pane_id — уникальный внутри tmux-сервера
   local pane_id="${TMUX_PANE:-}"
   [ -z "$pane_id" ] && pane_id="$(tmux display -p '#{pane_id}' 2>/dev/null || true)"
   pane_id="${pane_id#%}"
   [ -z "$pane_id" ] && die "не удалось определить tmux pane_id"
 
-  # PWD-хеш — чтобы переключения между аккаунтами не путались между разными
-  # директориями: ключ = (socket, pane, cwd, account).
-  local pwd_hash; pwd_hash="$(printf '%s' "$PWD" | cksum | cut -d' ' -f1)"
+  # ──────────────────────────────────────────────────────────────────────
+  # МОДЕЛЬ:
+  #   1. Без explicit_sid: «одна беседа, разные аккаунты». session_id из
+  #      state-файла текущего pane'а, cwd не меняется. Беседа продолжается,
+  #      меняется только CLAUDE_CONFIG_DIR.
+  #   2. С explicit_sid: переключаемся на КОНКРЕТНУЮ сессию (возможно из
+  #      другого worktree). cwd берём из её jsonl, респавним pane туда.
+  # ──────────────────────────────────────────────────────────────────────
 
+  local target_pwd="$PWD"
   local session_id=""
-  local state_file="$TMUX_SWITCH_DIR/$socket_name.p$pane_id.$pwd_hash.$name"
-  [ -f "$state_file" ] && session_id="$(cat "$state_file" | tr -d '[:space:]')"
 
-  # Legacy-фолбэк: для пэйнов, открытых ДО апгрейда, нового-формата state нет
-  # (хук в существующей сессии не фаерится). Берём legacy <socket>.<account> и
-  # промоутим в новый ключ, ЕСЛИ jsonl этой сессии лежит в projects/<pwd>/.
-  # Валидация по PWD страхует от резюма в чужой проект.
-  if [ -z "$session_id" ]; then
-    local _legacy="$TMUX_SWITCH_DIR/$socket_name.$name"
-    if [ -f "$_legacy" ]; then
-      local _legacy_sid; _legacy_sid="$(cat "$_legacy" | tr -d '[:space:]')"
-      if [ -n "$_legacy_sid" ]; then
-        local _enc_l; _enc_l="$(printf '%s' "$PWD" | sed 's|/|-|g')"
-        if [ -s "$SHARED_DIR/projects/$_enc_l/$_legacy_sid.jsonl" ]; then
-          session_id="$_legacy_sid"
-          printf '%s' "$session_id" > "$state_file"
-          log "promote legacy state → $state_file"
+  # ─── 1) Определяем session_id ────────────────────────────────────────
+  if [ -n "$explicit_sid" ]; then
+    if ! [[ "$explicit_sid" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+      die "session_id '$explicit_sid' не похож на UUID"
+    fi
+    session_id="$explicit_sid"
+  else
+    local pwd_hash; pwd_hash="$(printf '%s' "$PWD" | cksum | cut -d' ' -f1)"
+    local current_account=""
+    if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+      local _b; _b="$(basename "$CLAUDE_CONFIG_DIR")"
+      case "$_b" in claude-*) current_account="${_b#claude-}" ;; esac
+    fi
+    if [ -n "$current_account" ]; then
+      local cur_state="$TMUX_SWITCH_DIR/$socket_name.p$pane_id.$pwd_hash.$current_account"
+      [ -f "$cur_state" ] && session_id="$(cat "$cur_state" | tr -d '[:space:]')"
+      # Fallback по pane без учёта pwd_hash: ищем любой state-файл этого
+      # пэйна для $current_account (на случай если $PWD расходится с тем,
+      # как claude закодировал project-папку — типичный кейс worktree).
+      if [ -z "$session_id" ]; then
+        shopt -s nullglob
+        local _f
+        for _f in "$TMUX_SWITCH_DIR/$socket_name.p$pane_id."*."$current_account"; do
+          [ -f "$_f" ] || continue
+          # Проверяем что это паттерн p<pane>.<hash>.<account>, а не p<pane>.<account>
+          local _bn; _bn="${_f##*/}"
+          local _suffix="${_bn#$socket_name.p$pane_id.}"
+          # _suffix должен быть либо <hash>.<account>, либо просто <account>
+          case "$_suffix" in
+            *.*) ;;     # содержит точку — формат с хэшем, ОК
+            *) continue ;;  # без точки — это legacy <socket>.<account>, обработаем позже
+          esac
+          session_id="$(cat "$_f" | tr -d '[:space:]')"
+          [ -n "$session_id" ] && break
+        done
+        shopt -u nullglob
+      fi
+      # Legacy <socket>.<account>
+      if [ -z "$session_id" ]; then
+        local cur_legacy="$TMUX_SWITCH_DIR/$socket_name.$current_account"
+        [ -f "$cur_legacy" ] && session_id="$(cat "$cur_legacy" | tr -d '[:space:]')"
+      fi
+    fi
+  fi
+
+  # ─── 2) Находим jsonl ВЕЗДЕ и достаём из него реальный cwd ─────────
+  # Это критично для worktree-кейса: $PWD может не совпадать с тем, как
+  # claude закодировал project-папку. Источник истины — сама jsonl.
+  if [ -n "$session_id" ]; then
+    local jsonl
+    jsonl="$(find "$SHARED_DIR/projects" -name "${session_id}.jsonl" -type f -size +0 2>/dev/null | head -1)"
+    if [ -z "$jsonl" ]; then
+      log "session $session_id не найдена в projects/ — открываю fresh под '$name'"
+      session_id=""
+    else
+      local extracted_cwd
+      extracted_cwd="$(grep -m1 -oE '"cwd":"[^"]+"' "$jsonl" 2>/dev/null | sed 's/^"cwd":"//; s/"$//')"
+      if [ -n "$extracted_cwd" ] && [ -d "$extracted_cwd" ]; then
+        target_pwd="$extracted_cwd"
+      elif [ -n "$extracted_cwd" ]; then
+        if [ -n "$explicit_sid" ]; then
+          die "cwd '$extracted_cwd' не существует (worktree удалён?)"
+        else
+          log "cwd '$extracted_cwd' не существует — открываю fresh под '$name'"
+          session_id=""
         fi
       fi
     fi
   fi
 
-  # Жёсткая валидация: jsonl должен лежать ровно в projects/<encoded-pwd>/.
-  # Никаких find-фолбэков по другим проектам — иначе резюм уезжает в чужой
-  # контекст ("переключило не туда"). Если jsonl нет → fresh + чистим state.
+  # ─── 3) Сохраняем state-файл для будущих back-switch ────────────────
+  local target_pwd_hash; target_pwd_hash="$(printf '%s' "$target_pwd" | cksum | cut -d' ' -f1)"
+  local target_state="$TMUX_SWITCH_DIR/$socket_name.p$pane_id.$target_pwd_hash.$name"
   if [ -n "$session_id" ]; then
-    local _enc; _enc="$(printf '%s' "$PWD" | sed 's|/|-|g')"
-    if [ ! -s "$SHARED_DIR/projects/$_enc/$session_id.jsonl" ]; then
-      log "session $session_id для этого PWD недоступна — открываю fresh"
-      rm -f "$state_file"
-      session_id=""
-    fi
+    printf '%s' "$session_id" > "$target_state"
   fi
 
   local color; color="$(get_color "$name")"
   tmux -L "$socket_name" set -g pane-active-border-style "fg=$color" 2>/dev/null || true
   tmux -L "$socket_name" set -g status-style "bg=$color,fg=black" 2>/dev/null || true
 
-  # respawn-pane вместо respawn-window: переключение не убивает соседние пэйны
-  # в том же окне (vim/tests/etc). При single-pane поведение идентично.
+  printf '%s switch s=%s p=%s h=%s a=%s sid=%s pwd=%s\n' \
+      "$(date +%s)" "$socket_name" "$pane_id" "$target_pwd_hash" "$name" "${session_id:-<fresh>}" "$target_pwd" \
+      >> "$HOME/.local/share/claude-shared/cs.log" 2>/dev/null || true
+
+  # ─── 4) Респавним pane: --dangerously-skip-permissions всегда ──────
   if [ -n "$session_id" ]; then
-    exec tmux -L "$socket_name" respawn-pane -k -c "$PWD" \
-      "env CLAUDE_CONFIG_DIR='$dir' claude --resume '$session_id'"
+    exec tmux -L "$socket_name" respawn-pane -k -c "$target_pwd" \
+      "env CLAUDE_CONFIG_DIR='$dir' claude --dangerously-skip-permissions --resume '$session_id'"
   else
-    exec tmux -L "$socket_name" respawn-pane -k -c "$PWD" \
-      "env CLAUDE_CONFIG_DIR='$dir' claude"
+    exec tmux -L "$socket_name" respawn-pane -k -c "$target_pwd" \
+      "env CLAUDE_CONFIG_DIR='$dir' claude --dangerously-skip-permissions"
   fi
 }
 
@@ -672,14 +744,21 @@ ${C_DIM}https://github.com/Daniil-Sakharov/CS${C_RESET}
 
 ${C_BOLD}запуск:${C_RESET}
   cs <name> [args...]      запустить Claude под аккаунтом в tmux
+  cs <name> <session_id>   запустить + резюмить указанную сессию (UUID)
   cs                       интерактивный выбор
 
 ${C_BOLD}внутри tmux/Claude:${C_RESET}
-  cs switch <name>         переключить аккаунт без потери беседы
-  /<name>                  то же, как слэш-команда
+  cs <name>                переключить аккаунт в текущем pane
+                           (= cs switch <name>, не падает с "уже внутри tmux")
+  cs <name> <session_id>   переключить аккаунт + резюмить КОНКРЕТНУЮ сессию,
+                           даже если она была в другом worktree (cwd авто-меняется)
+  cs switch <name> [<sid>] то же что cs <name> [<sid>] из tmux
+  /<name>                  переключить аккаунт (slash-команда)
   /cs <subcommand>         любая подкоманда из Claude
   /accounts                список аккаунтов
   /account                 текущий аккаунт
+  /cs usage [<name>]       лимиты Claude (--all все, --refresh обойти кеш)
+                           ${C_DIM}(нативный /usage остаётся claude'овским — для текущей сессии)${C_RESET}
 
 ${C_BOLD}управление:${C_RESET}
   cs ls                    список аккаунтов
@@ -691,6 +770,9 @@ ${C_BOLD}управление:${C_RESET}
   cs rename <old> <new>    переименовать
   cs set-color <name> <c>  цвет окна (red/green/yellow/blue/magenta/cyan)
   cs doctor                проверить зависимости и состояние
+  cs usage [<name>]        лимиты Claude (текущий или конкретный аккаунт)
+                           cs usage --all      — все аккаунты
+                           cs usage --refresh  — обойти 10-мин кеш
   cs help                  эта справка
 EOF
   echo
@@ -705,30 +787,55 @@ cmd_launch() {
   local dir; dir="$(account_dir "$name")"
   [ -d "$dir" ] || die "аккаунт '$name' не существует. cs add $name — чтобы создать"
 
+  # Inside tmux: redirect to cmd_switch, optionally with explicit session_id.
+  # Это даёт удобную команду:
+  #   cs john              — переключить аккаунт в текущем pane (=cs switch john)
+  #   cs john <session_id> — переключить + резюмить КОНКРЕТНУЮ сессию (другой worktree)
   if [ -n "${TMUX:-}" ]; then
-    die "уже внутри tmux. для переключения: cs switch $name. для нового tmux — открой Alacritty/iTerm и запусти cs $name там"
+    if [[ "${1:-}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+      cmd_switch "$name" "$1"
+    else
+      cmd_switch "$name"
+    fi
+    return
   fi
 
+  # Outside tmux: если передан session_id, нужно поднять tmux в правильном
+  # worktree (cwd берём из jsonl сессии — поддерживает cs john <sid> из main
+  # checkout'а для сессии, что жила в worktree).
+  local launch_pwd="$PWD"
   if [[ "${1:-}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+    local _sid="$1"
+    local _jsonl
+    _jsonl="$(find "$SHARED_DIR/projects" -name "${_sid}.jsonl" -type f -size +0 2>/dev/null | head -1)"
+    [ -z "$_jsonl" ] && die "session $_sid не найдена в $SHARED_DIR/projects"
+    local _cwd
+    _cwd="$(grep -m1 -oE '"cwd":"[^"]+"' "$_jsonl" 2>/dev/null | sed 's/^"cwd":"//; s/"$//')"
+    if [ -n "$_cwd" ] && [ -d "$_cwd" ]; then
+      launch_pwd="$_cwd"
+      log "сессия жила в $launch_pwd — поднимаю tmux там"
+    elif [ -n "$_cwd" ]; then
+      die "cwd '$_cwd' для сессии $_sid не существует (worktree удалён?)"
+    fi
     set -- --resume "$@"
   fi
 
   if ! command -v tmux >/dev/null 2>&1; then
     log "tmux не установлен — запускаю claude напрямую"
     log "переключение между аккаунтами без перезапуска (cs switch) требует tmux"
-    exec env CLAUDE_CONFIG_DIR="$dir" claude "$@"
+    exec env CLAUDE_CONFIG_DIR="$dir" claude --dangerously-skip-permissions "$@"
   fi
 
   local sock="claude-$$"
   local color; color="$(get_color "$name")"
 
-  local args_quoted=""
+  local args_quoted=" --dangerously-skip-permissions"
   local a
   for a in "$@"; do
     args_quoted+=" $(printf '%q' "$a")"
   done
 
-  tmux -L "$sock" new-session -d -s main -c "$PWD" \
+  tmux -L "$sock" new-session -d -s main -c "$launch_pwd" \
     "env CLAUDE_CONFIG_DIR='$dir' claude$args_quoted"
   tmux -L "$sock" set -g pane-active-border-style "fg=$color" 2>/dev/null || true
   tmux -L "$sock" set -g status-style "bg=$color,fg=black" 2>/dev/null || true
@@ -846,6 +953,87 @@ cmd_doctor_v2_prune() {
 }
 
 
+cmd_usage() {
+  local target_account="" force=0 show_all=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -r|--refresh) force=1; shift ;;
+      -a|--all)     show_all=1; shift ;;
+      -h|--help)
+        cat <<'EOF'
+cs usage — показать недельные/сессионные лимиты Claude для аккаунта.
+
+использование:
+  cs usage                  # текущий аккаунт (CLAUDE_CONFIG_DIR)
+  cs usage <name>           # конкретный аккаунт
+  cs usage --all            # все аккаунты подряд
+  cs usage --refresh        # игнорировать кеш (TTL 10 мин)
+
+как работает:
+  запускает `claude --print "/usage"` под нужным аккаунтом, кеширует
+  результат в ~/.local/share/claude-shared/usage-cache/<account>.txt.
+EOF
+        return 0 ;;
+      -*) die "неизвестный флаг: $1" ;;
+      *)
+        if [ -z "$target_account" ]; then target_account="$1"
+        else die "лишний аргумент: $1"
+        fi
+        shift ;;
+    esac
+  done
+
+  local accounts=()
+  if [ "$show_all" -eq 1 ]; then
+    while IFS= read -r n; do accounts+=("$n"); done < <(list_accounts)
+    [ ${#accounts[@]} -eq 0 ] && die "аккаунтов нет"
+  elif [ -n "$target_account" ]; then
+    [ -d "$(account_dir "$target_account")" ] || die "аккаунт '$target_account' не существует"
+    accounts=("$target_account")
+  else
+    local cur; cur="$(current_account 2>/dev/null || true)"
+    [ -z "$cur" ] && die "не задан аккаунт и текущий не определён. cs usage <name> или cs usage --all"
+    accounts=("$cur")
+  fi
+
+  local cache_dir="$SHARED_DIR/usage-cache"
+  mkdir -p "$cache_dir"
+  local ttl=600  # 10 минут
+
+  local n
+  for n in "${accounts[@]}"; do
+    local dir; dir="$(account_dir "$n")"
+    local cache_file="$cache_dir/$n.txt"
+    local color; color="$(get_color "$n")"
+    local now; now="$(date +%s)"
+    local age=99999 from_cache=0
+    if [ "$force" -eq 0 ] && [ -f "$cache_file" ]; then
+      local cm; cm="$(file_mtime "$cache_file")"
+      age=$((now - cm))
+      [ "$age" -lt "$ttl" ] && from_cache=1
+    fi
+
+    echo
+    echo "${C_BOLD}═══ $n ═══${C_RESET}  ${C_DIM}(цвет: $color)${C_RESET}"
+    if [ "$from_cache" -eq 1 ]; then
+      cat "$cache_file"
+      echo "${C_DIM}(из кеша, age=${age}s — обновить: cs usage $n --refresh)${C_RESET}"
+    else
+      log "запрашиваю /usage у claude под '$n'..."
+      local output rc
+      output="$(env CLAUDE_CONFIG_DIR="$dir" claude --print --output-format text --permission-mode default "/usage" 2>&1)"
+      rc=$?
+      if [ $rc -ne 0 ]; then
+        echo "${C_RED}не удалось получить usage (exit=$rc):${C_RESET}"
+        echo "$output" | head -20
+        continue
+      fi
+      printf '%s\n' "$output" > "$cache_file"
+      echo "$output"
+    fi
+  done
+}
+
 main() {
   local cmd="${1:-}"
   case "$cmd" in
@@ -868,6 +1056,7 @@ main() {
     set-color)      shift; cmd_set_color "$@" ;;
     import)         shift; cmd_import "$@" ;;
     help|-h|--help) cmd_help ;;
+    usage|limits)   shift; cmd_usage "$@" ;;
     *)
       local dir; dir="$(account_dir "$cmd")"
       if [ -d "$dir" ]; then

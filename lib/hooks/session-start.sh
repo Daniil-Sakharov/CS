@@ -34,11 +34,20 @@ pane_id="${TMUX_PANE:-}"
 pane_id="${pane_id#%}"
 [ -z "$pane_id" ] && exit 0
 
-# pwd hash (стабильный, короткий)
-pwd_val="${cwd_in:-${PWD:-/}}"
+# pwd hash. Источник истины — $PWD env var (ровно то же читает cmd_switch).
+# input.cwd оставлен только как фолбэк, если PWD пустой.
+pwd_val="${PWD:-${cwd_in:-/}}"
 pwd_hash="$(printf '%s' "$pwd_val" | cksum | cut -d' ' -f1)"
 
 dir="$HOME/.local/share/claude-shared/tmux-switch"
 mkdir -p "$dir"
-printf '%s' "$session_id" > "$dir/$socket_name.p$pane_id.$pwd_hash.$account"
+state_path="$dir/$socket_name.p$pane_id.$pwd_hash.$account"
+printf '%s' "$session_id" > "$state_path"
+
+# debug log — одна строка для пары «hook write» / «switch read».
+log_file="$HOME/.local/share/claude-shared/cs.log"
+printf '%s hook  s=%s p=%s h=%s a=%s sid=%s pwd=%s\n' \
+    "$(date +%s)" "$socket_name" "$pane_id" "$pwd_hash" "$account" "$session_id" "$pwd_val" \
+    >> "$log_file" 2>/dev/null || true
+
 exit 0
