@@ -916,14 +916,16 @@ cmd_doctor_v2() {
 
   local total=0 valid=0 stale_jsonl=0 dead_socket=0 empty=0
   shopt -s nullglob
-  local f fname socket pid sid
+  local f fname socket sid
   for f in "$TMUX_SWITCH_DIR"/*; do
     [ -f "$f" ] || continue
     total=$((total+1))
     fname="$(basename "$f")"
     socket="${fname%%.*}"
-    pid="${socket#claude-}"
-    if ! kill -0 "$pid" 2>/dev/null; then
+    # Check tmux server alive via socket name, not parsed PID. Старый
+    # `kill -0 "${socket#claude-}"` ломался для custom socket names
+    # (cs -L mysocket → "mysocket" — kill -0 "mysocket" даёт false positive).
+    if ! tmux -L "$socket" list-sessions >/dev/null 2>&1; then
       dead_socket=$((dead_socket+1))
       continue
     fi
@@ -958,13 +960,13 @@ cmd_doctor_v2() {
 cmd_doctor_v2_prune() {
   local removed=0 kept=0
   shopt -s nullglob
-  local f fname socket pid sid
+  local f fname socket sid
   for f in "$TMUX_SWITCH_DIR"/*; do
     [ -f "$f" ] || continue
     fname="$(basename "$f")"
     socket="${fname%%.*}"
-    pid="${socket#claude-}"
-    if ! kill -0 "$pid" 2>/dev/null; then
+    # tmux server check — robust против custom socket names.
+    if ! tmux -L "$socket" list-sessions >/dev/null 2>&1; then
       rm -f "$f"; removed=$((removed+1)); continue
     fi
     sid="$(cat "$f" 2>/dev/null | tr -d '[:space:]')"
@@ -1050,8 +1052,19 @@ EOF
     else
       log "запрашиваю /usage у claude под '$n'..."
       local output rc
-      output="$(env CLAUDE_CONFIG_DIR="$dir" claude --print --output-format text --permission-mode default "/usage" 2>&1)"
+      # Portable 15s timeout (gtimeout от brew coreutils на mac, timeout
+      # на Linux). Без него claude --print с истёкшим токеном висит вечно
+      # и блокирует cmd_usage --all на минуты.
+      local _timeout=""
+      if command -v gtimeout >/dev/null 2>&1; then _timeout="gtimeout 15"
+      elif command -v timeout >/dev/null 2>&1; then _timeout="timeout 15"
+      fi
+      output="$($_timeout env CLAUDE_CONFIG_DIR="$dir" claude --print --output-format text --permission-mode default "/usage" 2>&1)"
       rc=$?
+      if [ $rc -eq 124 ]; then
+        echo "${C_RED}timeout (15s) — токен истёк или claude висит. Перезапиши через 'cs add $n --import' если так.${C_RESET}"
+        continue
+      fi
       if [ $rc -ne 0 ]; then
         echo "${C_RED}не удалось получить usage (exit=$rc):${C_RESET}"
         echo "$output" | head -20
