@@ -422,10 +422,14 @@ cmd_switch() {
   # ──────────────────────────────────────────────────────────────────────
   # МОДЕЛЬ:
   #   1. Без explicit_sid: «одна беседа, разные аккаунты». session_id из
-  #      state-файла текущего pane'а, cwd не меняется. Беседа продолжается,
-  #      меняется только CLAUDE_CONFIG_DIR.
+  #      pane-keyed state-файла (один на pane/pwd, аккаунт в ключ не входит).
+  #      Беседа продолжается, меняется только CLAUDE_CONFIG_DIR.
   #   2. С explicit_sid: переключаемся на КОНКРЕТНУЮ сессию (возможно из
   #      другого worktree). cwd берём из её jsonl, респавним pane туда.
+  #
+  #   State-файл живёт по пути:
+  #     $TMUX_SWITCH_DIR/<socket>.p<pane>.<pwdhash>
+  #   Hook (session-start.sh) перетирает его на каждый старт/ротацию sid.
   # ──────────────────────────────────────────────────────────────────────
 
   local target_pwd="$PWD"
@@ -439,39 +443,52 @@ cmd_switch() {
     session_id="$explicit_sid"
   else
     local pwd_hash; pwd_hash="$(printf '%s' "$PWD" | cksum | cut -d' ' -f1)"
-    local current_account=""
-    if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
-      local _b; _b="$(basename "$CLAUDE_CONFIG_DIR")"
-      case "$_b" in claude-*) current_account="${_b#claude-}" ;; esac
-    fi
-    if [ -n "$current_account" ]; then
-      local cur_state="$TMUX_SWITCH_DIR/$socket_name.p$pane_id.$pwd_hash.$current_account"
-      [ -f "$cur_state" ] && session_id="$(cat "$cur_state" | tr -d '[:space:]')"
-      # Fallback по pane без учёта pwd_hash: ищем любой state-файл этого
-      # пэйна для $current_account (на случай если $PWD расходится с тем,
-      # как claude закодировал project-папку — типичный кейс worktree).
-      if [ -z "$session_id" ]; then
-        shopt -s nullglob
-        local _f
-        for _f in "$TMUX_SWITCH_DIR/$socket_name.p$pane_id."*."$current_account"; do
-          [ -f "$_f" ] || continue
-          # Проверяем что это паттерн p<pane>.<hash>.<account>, а не p<pane>.<account>
-          local _bn; _bn="${_f##*/}"
-          local _suffix="${_bn#$socket_name.p$pane_id.}"
-          # _suffix должен быть либо <hash>.<account>, либо просто <account>
-          case "$_suffix" in
-            *.*) ;;     # содержит точку — формат с хэшем, ОК
-            *) continue ;;  # без точки — это legacy <socket>.<account>, обработаем позже
-          esac
-          session_id="$(cat "$_f" | tr -d '[:space:]')"
-          [ -n "$session_id" ] && break
-        done
-        shopt -u nullglob
+
+    # Primary: pane-keyed state (новый формат, после миграции — единственный
+    # источник истины). Содержит последний активный sid в этом pane/pwd.
+    local pane_state="$TMUX_SWITCH_DIR/$socket_name.p$pane_id.$pwd_hash"
+    [ -f "$pane_state" ] && session_id="$(cat "$pane_state" | tr -d '[:space:]')"
+
+    # Legacy fallbacks — для state-файлов, оставшихся от старого формата
+    # (per-account ключ). Срабатывают только если новый pane_state ещё не
+    # записан (например, claude в этом pane стартовал ДО апгрейда и hook
+    # с тех пор не вызывался). Hook на следующем старте/ротации перепишет
+    # state в новый формат и почистит legacy-файлы.
+    if [ -z "$session_id" ]; then
+      local current_account=""
+      if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+        local _b; _b="$(basename "$CLAUDE_CONFIG_DIR")"
+        case "$_b" in claude-*) current_account="${_b#claude-}" ;; esac
       fi
-      # Legacy <socket>.<account>
-      if [ -z "$session_id" ]; then
-        local cur_legacy="$TMUX_SWITCH_DIR/$socket_name.$current_account"
-        [ -f "$cur_legacy" ] && session_id="$(cat "$cur_legacy" | tr -d '[:space:]')"
+      if [ -n "$current_account" ]; then
+        local cur_state="$TMUX_SWITCH_DIR/$socket_name.p$pane_id.$pwd_hash.$current_account"
+        [ -f "$cur_state" ] && session_id="$(cat "$cur_state" | tr -d '[:space:]')"
+        # Fallback по pane без учёта pwd_hash: ищем любой legacy state-файл
+        # этого пэйна для $current_account (на случай если $PWD расходится
+        # с тем, как claude закодировал project-папку — типичный кейс
+        # worktree).
+        if [ -z "$session_id" ]; then
+          shopt -s nullglob
+          local _f
+          for _f in "$TMUX_SWITCH_DIR/$socket_name.p$pane_id."*."$current_account"; do
+            [ -f "$_f" ] || continue
+            # Паттерн p<pane>.<hash>.<account>, а не p<pane>.<account>.
+            local _bn; _bn="${_f##*/}"
+            local _suffix="${_bn#$socket_name.p$pane_id.}"
+            case "$_suffix" in
+              *.*) ;;     # содержит точку — формат с хэшем, ОК
+              *) continue ;;  # без точки — старый <socket>.<account>, обработаем ниже
+            esac
+            session_id="$(cat "$_f" | tr -d '[:space:]')"
+            [ -n "$session_id" ] && break
+          done
+          shopt -u nullglob
+        fi
+        # Very-old legacy: <socket>.<account>
+        if [ -z "$session_id" ]; then
+          local cur_legacy="$TMUX_SWITCH_DIR/$socket_name.$current_account"
+          [ -f "$cur_legacy" ] && session_id="$(cat "$cur_legacy" | tr -d '[:space:]')"
+        fi
       fi
     fi
   fi
@@ -502,10 +519,22 @@ cmd_switch() {
   fi
 
   # ─── 3) Сохраняем state-файл для будущих back-switch ────────────────
+  # Pane-keyed формат: <socket>.p<pane>.<pwdhash>. Аккаунт в ключ не
+  # входит — после ротации sid'а внутри claude hook перетирает один
+  # source-of-truth, и при любом следующем cs switch мы читаем актуальный
+  # sid независимо от того, под каким аккаунтом он сейчас живёт.
   local target_pwd_hash; target_pwd_hash="$(printf '%s' "$target_pwd" | cksum | cut -d' ' -f1)"
-  local target_state="$TMUX_SWITCH_DIR/$socket_name.p$pane_id.$target_pwd_hash.$name"
+  local target_state="$TMUX_SWITCH_DIR/$socket_name.p$pane_id.$target_pwd_hash"
   if [ -n "$session_id" ]; then
     printf '%s' "$session_id" > "$target_state"
+    # Cleanup legacy per-account state-файлов для этого pane/pwd.
+    # Глоб <target_state>.* ловит только legacy (новый файл без точки в конце).
+    shopt -s nullglob
+    local _legacy
+    for _legacy in "$target_state."*; do
+      [ -f "$_legacy" ] && rm -f "$_legacy"
+    done
+    shopt -u nullglob
   fi
 
   local color; color="$(get_color "$name")"

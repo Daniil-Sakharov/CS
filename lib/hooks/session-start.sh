@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
 # SessionStart hook for cs.
 # Сохраняет session_id текущего Claude Code в state-файл, ключеванный по
-# (tmux-socket, pane_id, pwd, account). cs switch читает его обратно и через
+# (tmux-socket, pane_id, pwd). cs switch читает его обратно и через
 # `claude --resume` продолжает ту же беседу в том же пэйне для того же проекта.
 #
 # Путь state-файла:
-#   ~/.local/share/claude-shared/tmux-switch/<socket>.p<pane>.<pwdhash>.<account>
+#   ~/.local/share/claude-shared/tmux-switch/<socket>.p<pane>.<pwdhash>
+#
+# Аккаунт в ключ НЕ входит: claude ротирует session_id внутри одного аккаунта,
+# и hook этим обновлением должен перетирать единственный source-of-truth для
+# pane/pwd. Раньше ключ включал <account>, и после ротации обновлялся только
+# state-файл текущего аккаунта — соседние per-account файлы оставались со
+# старым sid и при следующем cs switch подсовывали устаревшую сессию.
 
 set -u
 
@@ -16,7 +22,8 @@ cwd_in="$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null)"
 [ -z "$session_id" ] && exit 0
 [ -z "${TMUX:-}" ] && exit 0
 
-# account ← CLAUDE_CONFIG_DIR
+# account ← CLAUDE_CONFIG_DIR. Не входит в state-key, но используется как
+# guard (пишем state только для cs-managed claude'ов) и для лога.
 account=""
 if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
     base="$(basename "$CLAUDE_CONFIG_DIR")"
@@ -41,8 +48,18 @@ pwd_hash="$(printf '%s' "$pwd_val" | cksum | cut -d' ' -f1)"
 
 dir="$HOME/.local/share/claude-shared/tmux-switch"
 mkdir -p "$dir"
-state_path="$dir/$socket_name.p$pane_id.$pwd_hash.$account"
+state_path="$dir/$socket_name.p$pane_id.$pwd_hash"
 printf '%s' "$session_id" > "$state_path"
+
+# Cleanup: убираем legacy per-account state-файлы для этого pane/pwd. После
+# записи pane-keyed файла они избыточны и могут только подсунуть устаревший
+# sid через legacy-fallback в cs switch. Совпадающий новый файл (без точки
+# в конце) под глоб "$state_path.*" не попадает.
+shopt -s nullglob
+for legacy in "$state_path."*; do
+    [ -f "$legacy" ] && rm -f "$legacy"
+done
+shopt -u nullglob
 
 # debug log — одна строка для пары «hook write» / «switch read».
 log_file="$HOME/.local/share/claude-shared/cs.log"
