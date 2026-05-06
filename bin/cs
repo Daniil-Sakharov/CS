@@ -1099,6 +1099,7 @@ main() {
     import)         shift; cmd_import "$@" ;;
     help|-h|--help) cmd_help ;;
     usage|limits)   shift; cmd_usage "$@" ;;
+    auto-switch)    shift; cmd_auto_switch "$@" ;;
     *)
       local dir; dir="$(account_dir "$cmd")"
       if [ -d "$dir" ]; then
@@ -1106,6 +1107,171 @@ main() {
       else
         die "неизвестная команда или аккаунт: '$cmd'. cs help — справка"
       fi
+      ;;
+  esac
+}
+
+cmd_auto_switch() {
+  # cs auto-switch [enable|disable|status|config|test]
+  local sub="${1:-status}"
+  local CONFIG_FILE="$SHARED_DIR/auto-switch/config.json"
+  local DETECTOR_HOOK="$HOME/.local/share/cs-shared/lib/hooks/stop-limit-detector.sh"
+  # Fallback: development location если cs запущен напрямую из ~/Desktop/CS
+  [ -f "$DETECTOR_HOOK" ] || DETECTOR_HOOK="$HOME/Desktop/CS/lib/hooks/stop-limit-detector.sh"
+  mkdir -p "$SHARED_DIR/auto-switch" 2>/dev/null
+
+  # Init config if missing
+  [ -f "$CONFIG_FILE" ] || cat > "$CONFIG_FILE" <<'EOF'
+{
+  "enabled": true,
+  "switch_threshold_pct": 90,
+  "skip_threshold_pct": 80,
+  "strategy": "lru_filtered",
+  "notify": "tmux"
+}
+EOF
+
+  case "$sub" in
+    enable)
+      python3 -c "
+import json
+p = '$CONFIG_FILE'
+d = json.load(open(p))
+d['enabled'] = True
+import os
+tmp = p + '.tmp'
+with open(tmp, 'w') as f:
+    json.dump(d, f, indent=2)
+os.replace(tmp, p)
+"
+      echo "${C_GREEN}✓${C_RESET} auto-switch enabled (threshold 90%, strategy LRU+filter)"
+
+      # Wire Stop hook in each account's settings.json
+      shopt -s nullglob
+      local d cnt=0
+      for d in "${ACCOUNTS_PREFIX}"*; do
+        [ -d "$d" ] || continue
+        local name="$(basename "$d" | sed 's/^claude-//')"
+        [ "$name" = "shared" ] && continue
+        case "$name" in *.removed-*) continue ;; esac
+
+        local sett="$d/settings.json"
+        [ -f "$sett" ] || continue
+
+        # Check if Stop hook already wired
+        if jq -e '.hooks.Stop' "$sett" >/dev/null 2>&1; then
+          if jq -e '.hooks.Stop[].hooks[] | select(.command | contains("stop-limit-detector"))' "$sett" >/dev/null 2>&1; then
+            continue  # already wired
+          fi
+        fi
+
+        # Wire it (preserving existing hooks)
+        local tmp="$sett.tmp"
+        jq --arg cmd "bash $DETECTOR_HOOK" '
+          .hooks //= {} |
+          .hooks.Stop //= [] |
+          .hooks.Stop += [{
+            "matcher": "*",
+            "hooks": [{"type": "command", "command": $cmd}]
+          }]
+        ' "$sett" > "$tmp" && mv "$tmp" "$sett" && cnt=$((cnt+1))
+      done
+      shopt -u nullglob
+      echo "  Wired Stop hook в $cnt account(s)"
+      ;;
+    disable)
+      python3 -c "
+import json
+p = '$CONFIG_FILE'
+d = json.load(open(p))
+d['enabled'] = False
+import os
+tmp = p + '.tmp'
+with open(tmp, 'w') as f:
+    json.dump(d, f, indent=2)
+os.replace(tmp, p)
+"
+      echo "${C_YELLOW}⚠${C_RESET} auto-switch disabled (Stop hooks remain wired — to fully remove run 'cs auto-switch unwire')"
+      ;;
+    status)
+      echo "═══ cs auto-switch status ═══"
+      echo ""
+      cat "$CONFIG_FILE" | python3 -m json.tool
+      echo ""
+      local AUTO_SWITCH_BIN="$HOME/.local/bin/cs-auto-switch"
+      [ -x "$AUTO_SWITCH_BIN" ] || AUTO_SWITCH_BIN="$HOME/Desktop/CS/bin/cs-auto-switch"
+      bash "$AUTO_SWITCH_BIN" --status 2>&1
+      echo ""
+      echo "▸ Limit signals (recent):"
+      ls -la "$SHARED_DIR/auto-switch/limit-signal/"*.json 2>/dev/null | head -5 || echo "  (none)"
+      ;;
+    config)
+      shift
+      if [ -z "${1:-}" ]; then
+        cat "$CONFIG_FILE"
+      else
+        ${EDITOR:-vi} "$CONFIG_FILE"
+      fi
+      ;;
+    test)
+      echo "▸ Simulating limit signal for current account..."
+      local current=""
+      [ -n "${CLAUDE_CONFIG_DIR:-}" ] && current="$(basename "$CLAUDE_CONFIG_DIR" | sed 's/^claude-//')"
+      [ -z "$current" ] && die "не в cs-managed claude (CLAUDE_CONFIG_DIR пуст)"
+
+      local sigdir="$SHARED_DIR/auto-switch/limit-signal"
+      mkdir -p "$sigdir"
+      cat > "$sigdir/$current.json" <<EOF
+{
+  "ts": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "account": "$current",
+  "reason": "test_simulation",
+  "session_id": "",
+  "stop_reason": "test",
+  "session_pct": 95,
+  "week_pct": 50
+}
+EOF
+      echo "  signal written: $sigdir/$current.json"
+      echo ""
+      echo "▸ Running cs-auto-switch --status..."
+      local AUTO_SWITCH_BIN="$HOME/.local/bin/cs-auto-switch"
+      [ -x "$AUTO_SWITCH_BIN" ] || AUTO_SWITCH_BIN="$HOME/Desktop/CS/bin/cs-auto-switch"
+      bash "$AUTO_SWITCH_BIN" --status
+      ;;
+    unwire)
+      shopt -s nullglob
+      local d cnt=0
+      for d in "${ACCOUNTS_PREFIX}"*; do
+        [ -d "$d" ] || continue
+        local name="$(basename "$d" | sed 's/^claude-//')"
+        [ "$name" = "shared" ] && continue
+        case "$name" in *.removed-*) continue ;; esac
+        local sett="$d/settings.json"
+        [ -f "$sett" ] || continue
+        if jq -e '.hooks.Stop[].hooks[] | select(.command | contains("stop-limit-detector"))' "$sett" >/dev/null 2>&1; then
+          local tmp="$sett.tmp"
+          jq '
+            .hooks.Stop |= map(
+              . as $stopHook |
+              ($stopHook.hooks |= map(select(.command | contains("stop-limit-detector") | not))) |
+              select(.hooks | length > 0)
+            ) |
+            if (.hooks.Stop | length) == 0 then del(.hooks.Stop) else . end
+          ' "$sett" > "$tmp" && mv "$tmp" "$sett" && cnt=$((cnt+1))
+        fi
+      done
+      shopt -u nullglob
+      echo "${C_GREEN}✓${C_RESET} unwired Stop hook from $cnt account(s)"
+      ;;
+    *)
+      echo "Usage: cs auto-switch [enable|disable|status|config|test|unwire]"
+      echo "  enable   — enable + wire Stop hook in all accounts"
+      echo "  disable  — disable (hooks remain wired)"
+      echo "  status   — show config + current state"
+      echo "  config   — view/edit JSON config (or 'config edit')"
+      echo "  test     — simulate limit signal (for current account)"
+      echo "  unwire   — remove Stop hook from all accounts"
       ;;
   esac
 }

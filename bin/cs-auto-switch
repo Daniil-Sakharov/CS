@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+# cs-auto-switch — orchestrator that picks next free account и triggers
+# `cs switch` in the appropriate tmux pane.
+#
+# Strategy: LRU + threshold filter
+#   1. Read limit-signal/<current_account>.json
+#   2. Filter accounts where parsed_pct < 80% (safety margin)
+#   3. From filtered, pick least-recently-used (last_switched_at TSV)
+#   4. If all >= 80% → escalate (notify, don't switch — protects against cascade)
+#   5. flock to prevent parallel triggers
+#
+# Usage:
+#   cs-auto-switch [--triggered-by <reason>] [--dry-run] [--force]
+#   cs-auto-switch --status     — show what would happen, don't act
+#
+# Exit codes:
+#   0 — switched OR no action needed
+#   1 — error (no current account / state corrupt)
+#   2 — escalation (all accounts at limit)
+
+set +e
+
+SHARED_DIR="$HOME/.local/share/claude-shared"
+AUTO_SWITCH_DIR="$SHARED_DIR/auto-switch"
+SIGNAL_DIR="$AUTO_SWITCH_DIR/limit-signal"
+USAGE_CACHE="$SHARED_DIR/usage-cache"
+LRU_FILE="$AUTO_SWITCH_DIR/last-switched.tsv"
+CONFIG_FILE="$AUTO_SWITCH_DIR/config.json"
+LOCK_FILE="$AUTO_SWITCH_DIR/lock"
+LOG_FILE="$HOME/.claude/logs/cs-auto-switch.log"
+ACCOUNTS_PREFIX="$HOME/.local/share/claude-"
+
+mkdir -p "$SIGNAL_DIR" "$AUTO_SWITCH_DIR" "$(dirname "$LOG_FILE")" 2>/dev/null
+
+# Init defaults if missing
+if [ ! -f "$CONFIG_FILE" ]; then
+    cat > "$CONFIG_FILE" <<'EOF'
+{
+  "enabled": true,
+  "switch_threshold_pct": 90,
+  "skip_threshold_pct": 80,
+  "strategy": "lru_filtered",
+  "notify": "tmux"
+}
+EOF
+fi
+
+_log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*" >> "$LOG_FILE"; }
+
+# ─── Args ─────────────────────────────────────────────────────────────────────
+DRY_RUN=0
+FORCE=0
+STATUS_ONLY=0
+TRIGGERED_BY="manual"
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run) DRY_RUN=1 ;;
+        --force) FORCE=1 ;;
+        --status) STATUS_ONLY=1 ;;
+        --triggered-by) shift; TRIGGERED_BY="${1:-manual}" ;;
+    esac
+    shift 2>/dev/null
+done
+
+# ─── Lock (portable: flock if available, else mkdir-based) ───────────────────
+LOCK_DIR="$AUTO_SWITCH_DIR/lock.d"
+if command -v flock >/dev/null 2>&1; then
+    if ! exec 200>"$LOCK_FILE"; then
+        _log "cannot open lock file"
+        exit 1
+    fi
+    if ! flock -n 200; then
+        _log "another auto-switch in progress (flock), exit"
+        exit 0
+    fi
+else
+    # mkdir-based locking — atomic on POSIX FS
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+        # Stale lock detection — force-remove if >5 min
+        if [ -d "$LOCK_DIR" ]; then
+            lock_age=$(( $(date +%s) - $(stat -f "%m" "$LOCK_DIR" 2>/dev/null || echo 0) ))
+            if [ "$lock_age" -gt 300 ]; then
+                _log "lock stale (${lock_age}s), force-remove"
+                rmdir "$LOCK_DIR" 2>/dev/null
+                mkdir "$LOCK_DIR" 2>/dev/null || { _log "cannot acquire lock after stale-clear"; exit 0; }
+            else
+                _log "another auto-switch in progress (mkdir-lock), exit"
+                exit 0
+            fi
+        fi
+    fi
+    trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
+fi
+
+# ─── Read enabled flag ───────────────────────────────────────────────────────
+ENABLED=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE')).get('enabled', True))" 2>/dev/null)
+if [ "$ENABLED" != "True" ] && [ "$FORCE" = "0" ]; then
+    _log "auto-switch disabled, skip"
+    exit 0
+fi
+
+SKIP_THRESHOLD=$(python3 -c "import json; print(json.load(open('$CONFIG_FILE')).get('skip_threshold_pct', 80))" 2>/dev/null)
+
+# ─── Identify current account ────────────────────────────────────────────────
+CURRENT=""
+if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+    base="$(basename "$CLAUDE_CONFIG_DIR")"
+    case "$base" in claude-*) CURRENT="${base#claude-}" ;; esac
+fi
+
+# Если нет CLAUDE_CONFIG_DIR — читаем from limit-signal самый свежий
+if [ -z "$CURRENT" ]; then
+    if [ -d "$SIGNAL_DIR" ]; then
+        latest_signal=$(ls -t "$SIGNAL_DIR"/*.json 2>/dev/null | head -1)
+        if [ -n "$latest_signal" ]; then
+            CURRENT=$(basename "$latest_signal" .json)
+        fi
+    fi
+fi
+
+if [ -z "$CURRENT" ]; then
+    _log "cannot determine current account"
+    exit 1
+fi
+
+_log "current=$CURRENT triggered_by=$TRIGGERED_BY"
+
+# ─── List candidate accounts ─────────────────────────────────────────────────
+candidates=()
+for d in "${ACCOUNTS_PREFIX}"*; do
+    [ -d "$d" ] || continue
+    name="$(basename "$d" | sed 's/^claude-//')"
+    [ "$name" = "shared" ] && continue
+    case "$name" in *.removed-*) continue ;; esac
+    [ "$name" = "$CURRENT" ] && continue
+    candidates+=("$name")
+done
+
+if [ ${#candidates[@]} -eq 0 ]; then
+    _log "no candidate accounts (only $CURRENT exists or all removed)"
+    [ "$STATUS_ONLY" = "1" ] && echo "status: no_candidates current=$CURRENT"
+    exit 2
+fi
+
+# ─── Filter by usage threshold ───────────────────────────────────────────────
+filtered=()
+for cand in "${candidates[@]}"; do
+    parsed_cache="$USAGE_CACHE/$cand.parsed.json"
+    if [ ! -f "$parsed_cache" ]; then
+        # No cache → assume available (optimistic)
+        filtered+=("$cand")
+        _log "$cand: no parsed cache, include (optimistic)"
+        continue
+    fi
+
+    # Cache age check (skip if >2h old — likely stale)
+    cache_age=$(( $(date +%s) - $(stat -f "%m" "$parsed_cache" 2>/dev/null || echo 0) ))
+    if [ "$cache_age" -gt 7200 ]; then
+        filtered+=("$cand")
+        _log "$cand: cache stale (>2h), include (optimistic)"
+        continue
+    fi
+
+    # Parse pct
+    session_pct=$(python3 -c "import json; v=json.load(open('$parsed_cache')).get('session_pct'); print(v if v is not None else 0)" 2>/dev/null)
+    week_pct=$(python3 -c "import json; v=json.load(open('$parsed_cache')).get('week_pct'); print(v if v is not None else 0)" 2>/dev/null)
+
+    # Skip если either pct >= skip_threshold
+    skip_this=false
+    if awk -v p="$session_pct" -v t="$SKIP_THRESHOLD" 'BEGIN { exit !(p >= t) }'; then
+        skip_this=true
+    fi
+    if awk -v p="$week_pct" -v t="$SKIP_THRESHOLD" 'BEGIN { exit !(p >= t) }'; then
+        skip_this=true
+    fi
+
+    if [ "$skip_this" = "true" ]; then
+        _log "$cand: skip (session=$session_pct% week=$week_pct% >= $SKIP_THRESHOLD%)"
+    else
+        filtered+=("$cand")
+        _log "$cand: include (session=$session_pct% week=$week_pct%)"
+    fi
+done
+
+if [ ${#filtered[@]} -eq 0 ]; then
+    _log "ESCALATION: all accounts at threshold — notify user, don't switch"
+    msg="⚠ All CS accounts >= $SKIP_THRESHOLD% — manual intervention needed."
+
+    # tmux notification if available
+    if command -v tmux >/dev/null 2>&1 && [ -n "${TMUX:-}" ]; then
+        tmux display-message -d 5000 "$msg" 2>/dev/null
+    fi
+
+    # Push notification (если терминал-сессия)
+    if command -v terminal-notifier >/dev/null 2>&1; then
+        terminal-notifier -title "CS Auto-Switch" -message "$msg" 2>/dev/null
+    fi
+
+    [ "$STATUS_ONLY" = "1" ] && echo "status: escalation current=$CURRENT all_at_threshold=true"
+    exit 2
+fi
+
+# ─── Pick LRU from filtered ──────────────────────────────────────────────────
+NEXT=""
+if [ -f "$LRU_FILE" ]; then
+    # last-switched.tsv: account<TAB>iso_date
+    # LRU = oldest timestamp from filtered list
+    for cand in "${filtered[@]}"; do
+        last=$(grep "^$cand	" "$LRU_FILE" 2>/dev/null | awk '{print $2}' | tail -1)
+        [ -z "$last" ] && last="0"
+        echo "$cand	$last"
+    done | sort -k2 | head -1 | awk '{print $1}' > /tmp/cs-auto-switch-next.$$
+    NEXT=$(cat /tmp/cs-auto-switch-next.$$ 2>/dev/null)
+    rm -f /tmp/cs-auto-switch-next.$$
+fi
+
+# Fallback: первый из filtered if LRU file missing
+[ -z "$NEXT" ] && NEXT="${filtered[0]}"
+
+_log "selected next: $NEXT"
+
+# ─── Status mode — output decision, don't act ───────────────────────────────
+if [ "$STATUS_ONLY" = "1" ]; then
+    echo "status: ready current=$CURRENT next=$NEXT candidates=${candidates[*]} filtered=${filtered[*]}"
+    exit 0
+fi
+
+# ─── Dry run — log decision, don't act ──────────────────────────────────────
+if [ "$DRY_RUN" = "1" ]; then
+    _log "DRY-RUN: would switch $CURRENT → $NEXT"
+    echo "DRY-RUN: would switch from $CURRENT to $NEXT"
+    exit 0
+fi
+
+# ─── Trigger cs switch in current tmux pane ─────────────────────────────────
+# Use existing limit-signal session_id if available для resume
+SESSION_ID=""
+if [ -f "$SIGNAL_DIR/$CURRENT.json" ]; then
+    SESSION_ID=$(python3 -c "import json; print(json.load(open('$SIGNAL_DIR/$CURRENT.json')).get('session_id') or '')" 2>/dev/null)
+fi
+
+# We're not inside the target tmux pane here (we're in some background shell).
+# `cs switch` без TMUX вообще falls through to direct exec. Чтобы реально
+# переключить юзеров pane, нужен tmux send-keys / respawn. Для этого:
+#   - Find pane where current account is running (tmux list-panes -F)
+#   - send-keys "cs switch $NEXT" к нему
+# Это требует tmux-side logic.
+
+# Простейший работоспособный first-iteration: log решение, запиши hint в
+# limit-signal/<current>.json (с полем "next: ...") — ждём что юзер увидит
+# уведомление и сам run cs switch. В будущем добавим tmux automation.
+
+# Update limit-signal с suggested next
+if [ -f "$SIGNAL_DIR/$CURRENT.json" ]; then
+    python3 -c "
+import json
+p = '$SIGNAL_DIR/$CURRENT.json'
+d = json.load(open(p))
+d['suggested_next'] = '$NEXT'
+d['suggested_at'] = '$(date -u +%Y-%m-%dT%H:%M:%SZ)'
+import os
+tmp = p + '.tmp'
+with open(tmp, 'w') as f:
+    json.dump(d, f, indent=2)
+os.replace(tmp, p)
+" 2>/dev/null
+fi
+
+# Tmux notification
+if command -v tmux >/dev/null 2>&1 && [ -n "${TMUX:-}" ]; then
+    tmux display-message -d 8000 "🔄 CS auto-switch: ${CURRENT} → ${NEXT} (run: cs switch $NEXT $SESSION_ID)" 2>/dev/null
+fi
+
+# Push notification
+if command -v terminal-notifier >/dev/null 2>&1; then
+    terminal-notifier -title "CS Auto-Switch" \
+        -message "Limit reached on $CURRENT. Run: cs switch $NEXT" \
+        -group "cs-auto-switch" 2>/dev/null
+fi
+
+# Update LRU (record что NEXT был "selected" — actual switch будет когда юзер run)
+echo "$NEXT	$(date -u +%Y-%m-%dT%H:%M:%SZ)	suggested" >> "$LRU_FILE"
+
+_log "suggested switch: $CURRENT → $NEXT (session_id=$SESSION_ID) — notification sent"
+
+exit 0
